@@ -1,0 +1,1 @@
+"""NimDaydu local service."""
