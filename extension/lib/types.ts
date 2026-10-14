@@ -14,10 +14,13 @@ export type CaptureState = {
   phase: Phase; source?: Source; sessionId?: string; startedAt?: number;
   model?: string; message?: string;
   pending?: boolean;
+  recovering?: boolean;
+  saveError?: string;
 };
-export type Snapshot = { state: CaptureState; captions: Caption[] };
-export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number };
-export const DEFAULT_SETTINGS: Settings = { schema: 2, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.8 };
+export type EnglishPreview = { sessionId: string; revision: number; text: string; start: number; end: number };
+export type Snapshot = { state: CaptureState; captions: Caption[]; preview?: EnglishPreview };
+export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number; autoSave: boolean };
+export const DEFAULT_SETTINGS: Settings = { schema: 2, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.8, autoSave: true };
 export function readSettings(saved?: Partial<Settings>): Settings {
   return saved?.schema === 2 ? { ...DEFAULT_SETTINGS, ...saved } : { ...DEFAULT_SETTINGS, token: saved?.token || '' };
 }
@@ -31,6 +34,12 @@ export function mergeCaption(captions: Caption[], incoming: Caption): Caption[] 
   const updated = captions.slice();
   updated[index] = { ...current, ...incoming };
   return updated;
+}
+
+export function mergePreview(current: EnglishPreview | undefined, incoming: EnglishPreview, sessionId?: string): EnglishPreview | undefined {
+  if (incoming.sessionId !== sessionId) return current;
+  if (current?.sessionId === incoming.sessionId && current.revision >= incoming.revision) return current;
+  return incoming;
 }
 
 export function applyTranslation(captions: Caption[], message: { sessionId: string; id: string; revision: number; text: string }): Caption[] {

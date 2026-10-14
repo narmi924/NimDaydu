@@ -1,8 +1,11 @@
 import { browser } from 'wxt/browser';
-import { applyTranslation, isActive, mergeCaption, SOCKET, type Caption, type CaptureState, type Source } from '../../lib/types';
+import { diagnosticSnapshot, recordDiagnostic } from '../../lib/diagnostics';
+import { applyTranslation, DEFAULT_SETTINGS, isActive, mergeCaption, mergePreview, SOCKET, type Caption, type CaptureState, type EnglishPreview, type Source } from '../../lib/types';
+import { OutputSync } from '../../lib/output-sync';
 
 let state: CaptureState = { phase: 'idle' };
 let captions: Caption[] = [];
+let preview: EnglishPreview | undefined;
 let media: MediaStream | undefined;
 let context: AudioContext | undefined;
 let worklet: AudioWorkletNode | undefined;
@@ -13,6 +16,22 @@ let sequence = 0;
 let stopping: Promise<void> | undefined;
 let translationOwner: string | undefined;
 const viewLeases = new Map<string, number>();
+// Match the service's finite recovery window rather than aborting a brief burst.
+const TRANSPORT_BACKLOG_SECONDS = 8;
+let fileSaveFailed = false;
+let translationSaveFailed = false;
+let savingUnsupported = false;
+function savingStatus() {
+  const saveError = savingUnsupported ? '请重启本机服务以启用自动保存；当前字幕请手动导出。'
+    : fileSaveFailed || translationSaveFailed ? '自动保存暂未完成。请保持本机服务运行；必要时手动导出字幕。' : undefined;
+  if (saveError !== state.saveError) {
+    recordDiagnostic('capture', saveError ? 'output_failed' : 'output_recovered');
+    setState({ saveError });
+  }
+}
+const outputs = new OutputSync(failed => { translationSaveFailed = failed; savingStatus(); });
+// Only chrome.runtime is available in an offscreen document. Settings are
+// read/watched by the service worker and delivered through runtime messages.
 
 function publish(message: Record<string, unknown>) {
   void browser.runtime.sendMessage({ target: 'ui', ...message }).catch(() => {});
@@ -39,7 +58,7 @@ async function stop(message?: string, failed = false) {
   if (stopping) return stopping;
   stopping = (async () => {
     setState({ phase: 'stopping' });
-    if (socket?.readyState === WebSocket.OPEN) {
+    if (!failed && socket?.readyState === WebSocket.OPEN) {
       const currentSocket = socket;
       const closed = new Promise<void>(resolve => {
         currentSocket.addEventListener('close', () => resolve(), { once: true });
@@ -49,15 +68,16 @@ async function stop(message?: string, failed = false) {
       await closed;
     }
     await cleanup();
-    setState({ phase: failed ? 'error' : 'stopped', message });
+    setState({ phase: failed ? 'error' : 'stopped', message, recovering: false });
   })().finally(() => { stopping = undefined; });
   return stopping;
 }
 
-async function start(source: Source, streamId: string, token: string, viewId: string, canTranslate: boolean, sentenceHold: number) {
+async function start(source: Source, streamId: string, token: string, viewId: string, canTranslate: boolean, sentenceHold: number, autoSave: boolean) {
   if (isActive(state.phase)) throw new Error('已有会话运行中。');
   await cleanup();
   captions = [];
+  preview = undefined;
   sequence = 0;
   lastLease = Date.now();
   viewLeases.set(viewId, lastLease);
@@ -83,30 +103,50 @@ async function start(source: Source, streamId: string, token: string, viewId: st
     const currentSocket = socket;
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('本机服务连接超时，请运行 start.ps1。')), 8000);
-      currentSocket.onopen = () => currentSocket.send(JSON.stringify({ type: 'hello', protocol: 1, token, sampleRate: rate, format: 'f32le', channels: 1, sentenceHold }));
+      currentSocket.onopen = () => currentSocket.send(JSON.stringify({ type: 'hello', protocol: 1, token, sampleRate: rate, format: 'f32le', channels: 1, sentenceHold,
+        autoSave, source: { title: source.title.slice(0, 500), site: source.site || '网页', host: source.host || '' } }));
       currentSocket.onmessage = event => {
         const message = JSON.parse(event.data);
         if (message.type === 'ready') {
           clearTimeout(timeout);
           setState({ phase: 'capturing', sessionId: message.sessionId, model: message.model });
+          savingUnsupported = autoSave && message.autoSaveSupported !== true;
+          outputs.begin(message.sessionId, token, autoSave && !savingUnsupported);
+          savingStatus();
           resolve();
         } else if (message.type === 'caption' && message.sessionId === state.sessionId) {
           if (!message.final) return;
-          captions = mergeCaption(captions, message as Caption);
-          publish({ type: 'caption', caption: message });
+          const { preview: remainingPreview, ...caption } = message;
+          captions = mergeCaption(captions, caption as Caption);
+          if (remainingPreview) preview = mergePreview(preview, { ...remainingPreview, sessionId: message.sessionId }, state.sessionId);
+          // Replace the preview and add its settled sentence atomically.
+          publish({ type: 'caption', caption, preview });
+        } else if (message.type === 'preview' && message.sessionId === state.sessionId) {
+          preview = mergePreview(preview, message as EnglishPreview, state.sessionId);
+          publish({ type: 'preview', preview });
         } else if (message.type === 'pending' && message.sessionId === state.sessionId && message.pending !== state.pending) {
           setState({ pending: message.pending });
+        } else if (message.type === 'backpressure' && message.sessionId === state.sessionId) {
+          setState({ recovering: Boolean(message.recovering) });
+        } else if (message.type === 'warning' && message.sessionId === state.sessionId) {
+          recordDiagnostic('capture', message.message ? 'refinement_fallback' : 'refinement_recovered');
+          setState({ message: message.message });
+        } else if (message.type === 'saving' && message.sessionId === state.sessionId) {
+          fileSaveFailed = Boolean(message.failed); savingStatus();
         } else if (message.type === 'error') {
+          recordDiagnostic('capture', message.code === 'asr_overload' ? 'asr_overload' : 'peer_error');
           clearTimeout(timeout);
           reject(new Error(message.message));
           if (state.phase !== 'starting' && state.phase !== 'stopping') void stop(message.message, true);
         }
       };
       currentSocket.onerror = () => {
+        recordDiagnostic('connection', 'socket_error');
         clearTimeout(timeout);
         reject(new Error('无法连接本机语音服务。请先运行 start.ps1。'));
       };
       currentSocket.onclose = event => {
+        recordDiagnostic('capture', 'socket_closed', { closeCode: event.code });
         clearTimeout(timeout);
         if (state.phase === 'starting') reject(new Error(event.code === 1008 ? '配对码不正确，请重新复制。' : '本机服务拒绝连接。'));
         else if (state.phase !== 'stopping' && isActive(state.phase)) {
@@ -123,8 +163,9 @@ async function start(source: Source, streamId: string, token: string, viewId: st
         lastMeter = Date.now();
       }
       if (state.phase !== 'capturing' || currentSocket.readyState !== WebSocket.OPEN) return;
-      if (currentSocket.bufferedAmount > rate * 4 * 2) {
-        void stop('音频发送积压，请检查本机服务后重新开始。', true);
+      if (currentSocket.bufferedAmount > rate * 4 * TRANSPORT_BACKLOG_SECONDS) {
+        recordDiagnostic('capture', 'transport_overload');
+        void stop('音频发送持续积压，已停止采集。请检查本机负载后重新开始；已有字幕已保留。', true);
         return;
       }
       const packet = new ArrayBuffer(12 + samples.byteLength);
@@ -146,7 +187,13 @@ async function start(source: Source, streamId: string, token: string, viewId: st
 browser.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.target !== 'offscreen' || sender.id !== browser.runtime.id) return;
   (async () => {
-    if (message.type === 'snapshot') return { state, captions };
+    if (message.type === 'snapshot') return { state, captions, preview };
+    if (message.type === 'diagnostics') return { phase: state.phase, recovering: Boolean(state.recovering), events: diagnosticSnapshot() };
+    if (message.type === 'settings') {
+      outputs.configure(message.autoSave === true);
+      if (message.autoSave === true) captions.forEach(caption => outputs.enqueue(caption));
+      return { ok: true };
+    }
     if (message.type === 'lease') {
       lastLease = Date.now();
       viewLeases.set(message.viewId, lastLease);
@@ -156,7 +203,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       if (!message.canTranslate && translationOwner === message.viewId) translationOwner = undefined;
       return { owner: translationOwner === message.viewId };
     }
-    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.viewId, message.canTranslate, message.sentenceHold || 0.8);
+    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.viewId, message.canTranslate, message.sentenceHold || 0.8, message.autoSave ?? DEFAULT_SETTINGS.autoSave);
     if (message.type === 'pause' && state.phase === 'capturing') {
       setState({ phase: 'paused' });
       socket?.send(JSON.stringify({ type: 'pause' }));
@@ -168,9 +215,12 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
     else if (message.type === 'translation') {
       if (message.viewId !== translationOwner) return { ok: false };
       captions = applyTranslation(captions, message);
+      const translated = captions.find(caption => caption.sessionId === message.sessionId && caption.id === message.id);
+      if (translated) outputs.enqueue(translated);
       publish({ ...message, target: 'ui' });
     } else if (message.type === 'clear' && !isActive(state.phase)) {
       captions = [];
+      preview = undefined;
       publish({ type: 'cleared' });
     }
     return { ok: true };
@@ -179,5 +229,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
 });
 
 setInterval(() => {
-  if (isActive(state.phase) && state.phase !== 'stopping' && Date.now() - lastLease > 10000) void stop('侧栏已关闭，采集自动停止。');
+  if (isActive(state.phase) && state.phase !== 'stopping' && Date.now() - lastLease > 10000) {
+    recordDiagnostic('capture', 'view_lease_expired'); void stop('侧栏已关闭，采集自动停止。');
+  }
 }, 2000);

@@ -14,6 +14,8 @@ class Hello(BaseModel):
     format: str = "f32le"
     channels: int = 1
     sentenceHold: float = Field(default=0.8, ge=0.4, le=1.5)
+    autoSave: bool = True
+    source: dict[str, str] = Field(default_factory=dict, max_length=3)
 
 
 @dataclass

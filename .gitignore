@@ -13,5 +13,6 @@ models/
 samples/*.wav
 samples/*.mp3
 artifacts/
+OUTPUTS/
 *.log
 

@@ -1,11 +1,11 @@
-import type { Caption } from './types';
+import type { Caption, ViewMode } from './types';
 export type Paragraph = { id: string; captions: Caption[] };
-/** Hide unfinished translations and preserve chronological reading order. */
-export function readableCaptions(captions: Caption[], translated: boolean, fallback = false): Caption[] {
+/** English is immediately readable; Chinese-only mode waits for translations. */
+export function readableCaptions(captions: Caption[], mode: ViewMode, fallback = false): Caption[] {
   const result: Caption[] = [];
   for (const caption of captions) {
     if (!caption.final) continue;
-    if (translated && !fallback && caption.translationRevision !== caption.revision) break;
+    if (mode === 'translated' && !fallback && caption.translationRevision !== caption.revision) break;
     result.push(caption);
   }
   return result;

@@ -6,11 +6,13 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -19,12 +21,15 @@ from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import ROOT, load_settings
-from .engine import MoonshineEngine
+from .refinement import create_engine
 from .protocol import FrameOrder, Hello, parse_frame
 from .translation import OfflineTranslator
 from .segmentation import SentenceAssembler
+from .outputs import OutputStore
 
 log = logging.getLogger("nimdaydu")
+AUDIO_STALL_TIMEOUT = 3.0
+AUDIO_RECOVERY_TIMEOUT = 8.0
 
 
 def allowed_origin(origin: str | None) -> bool:
@@ -43,7 +48,25 @@ class ProviderSettings(BaseModel):
     clear: bool = False
 
 
-def create_app(engine_factory=None, state_dir: Path | None = None, translator_factory=None):
+class ASRSettings(BaseModel):
+    model: Literal['small', 'medium', 'hybrid']
+
+
+class SavingSettings(BaseModel):
+    enabled: bool
+
+
+class SavedTranslation(BaseModel):
+    id: str = Field(pattern=r'^sentence:\d+$', max_length=100)
+    revision: int = Field(ge=1)
+    text: str = Field(min_length=1, max_length=8000)
+
+
+class SavedTranslations(BaseModel):
+    updates: list[SavedTranslation] = Field(max_length=100)
+
+
+def create_app(engine_factory=None, state_dir: Path | None = None, translator_factory=None, output_dir: Path | None = None):
     settings = load_settings(state_dir)
     providers = {'deepseek_key': settings.deepseek_key, 'deepseek_model': settings.deepseek_model}
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nimdaydu-asr")
@@ -52,10 +75,13 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
     offline_translator = None
     translation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nimdaydu-translate')
     busy = False
+    loading = False
+    capture_metrics = None
     translate_lock = asyncio.Lock()
     last_translation = 0.0
     identity = json.loads((ROOT / 'extension/identity.json').read_text(encoding='utf-8'))
     extension_origin = f"chrome-extension://{identity['extensionId']}"
+    outputs = OutputStore(output_dir or (state_dir / 'outputs' if state_dir else ROOT / 'OUTPUTS'))
 
     async def native(fn, *args):
         return await asyncio.get_running_loop().run_in_executor(executor, partial(fn, *args))
@@ -64,7 +90,7 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
     async def lifespan(_app):
         nonlocal engine, engine_error, offline_translator
         try:
-            engine = await native(engine_factory or MoonshineEngine, settings.model)
+            engine = await native(engine_factory or create_engine, settings.model)
             log.info("Local ASR ready: %s (CPU)", settings.model)
         except Exception:
             engine_error = "Model could not load. Run setup.ps1 or read .nimdaydu/service.err.log."
@@ -73,11 +99,17 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
             offline_translator = await asyncio.get_running_loop().run_in_executor(translation_executor, translator_factory or OfflineTranslator)
         except Exception:
             log.warning('Offline translation model unavailable. Run download_translation.py.', exc_info=True)
-        yield
-        if engine:
-            await native(engine.close)
-        executor.shutdown(wait=True)
-        translation_executor.shutdown(wait=True)
+        output_task = asyncio.create_task(outputs.run())
+        try:
+            yield
+        finally:
+            output_task.cancel()
+            await asyncio.gather(output_task, return_exceptions=True)
+            await outputs.flush()
+            if engine:
+                await native(engine.close)
+            executor.shutdown(wait=True)
+            translation_executor.shutdown(wait=True)
 
     app = FastAPI(title="NimDaydu Local", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
@@ -99,8 +131,10 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
 
     @app.get("/health")
     async def health():
-        return {"app": "NimDaydu", "version": "0.2.0", "ready": engine is not None,
-                "model": settings.model, "error": engine_error, "busy": busy, 'processId': os.getpid()}
+        return {"app": "NimDaydu", "version": "0.5.0", "ready": engine is not None and not loading,
+                "model": settings.model, "error": engine_error, "busy": busy, 'processId': os.getpid(),
+                'audio': capture_metrics, 'refinement': engine.metrics() if engine and hasattr(engine, 'metrics') else None,
+                'autoSaveFailed': outputs.failed}
 
     def verify_extension(request):
         # Browser-controlled Origin, never an extensionId supplied in a body.
@@ -116,16 +150,38 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
     @app.post('/connect')
     async def connect(request: Request):
         verify_extension(request)
-        return JSONResponse({'token': settings.token, 'ready': engine is not None, 'model': settings.model,
+        return JSONResponse({'token': settings.token, 'ready': engine is not None and not loading, 'model': settings.model,
                              'offlineTranslationReady': offline_translator is not None,
                              'deepseekConfigured': bool(providers['deepseek_key']), 'deepseekModel': providers['deepseek_model'],
-                             'version': '0.2.0', 'error': engine_error},
+                             'version': '0.5.0', 'error': engine_error, 'outputDirectory': str(outputs.directory)},
                             headers={'Access-Control-Allow-Origin': extension_origin})
 
     @app.get("/capabilities")
     async def capabilities(authorization: str | None = Header(default=None)):
         authorize(authorization)
         return {"deepseekConfigured": bool(providers['deepseek_key']), "model": settings.model, 'offlineTranslationReady': offline_translator is not None}
+
+    @app.post('/outputs/{session_id}/settings')
+    async def saving_settings(session_id: UUID, body: SavingSettings, request: Request, authorization: str | None = Header(default=None)):
+        verify_extension(request); authorize(authorization)
+        try:
+            outputs.enable(str(session_id), body.enabled)
+        except KeyError:
+            raise HTTPException(status_code=404, detail='Session is no longer available') from None
+        if not await outputs.flush(str(session_id)):
+            raise HTTPException(status_code=503, detail='Output write failed')
+        return {'ok': True}
+
+    @app.post('/outputs/{session_id}/translations')
+    async def save_translations(session_id: UUID, body: SavedTranslations, request: Request, authorization: str | None = Header(default=None)):
+        verify_extension(request); authorize(authorization)
+        try:
+            outputs.translations(str(session_id), [item.model_dump() for item in body.updates])
+        except KeyError:
+            raise HTTPException(status_code=404, detail='Session is no longer available') from None
+        if not await outputs.flush(str(session_id)):
+            raise HTTPException(status_code=503, detail='Output write failed')
+        return {'ok': True}
 
     @app.post('/providers/deepseek')
     async def save_provider(body: ProviderSettings, request: Request, authorization: str | None = Header(default=None)):
@@ -141,6 +197,42 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
         temporary.replace(destination)
         providers.update(updated)
         return {'deepseekConfigured': bool(key)}
+
+    @app.post('/models/asr')
+    async def select_asr(body: ASRSettings, request: Request, authorization: str | None = Header(default=None)):
+        nonlocal engine, engine_error, settings, loading
+        verify_extension(request); authorize(authorization)
+        if busy or loading:
+            raise HTTPException(status_code=409, detail='End capture before changing ASR')
+        def persist():
+            destination = (state_dir or ROOT / '.nimdaydu') / 'asr-model.json'
+            temporary = destination.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'model': body.model}), encoding='utf-8')
+            temporary.replace(destination)
+        if engine and settings.model == body.model:
+            persist()
+            return {'model': settings.model, 'ready': True}
+        loading = True
+        candidate = None
+        try:
+            candidate = await native(engine_factory or create_engine, body.model)
+            persist()
+            previous, engine = engine, candidate
+            candidate = None
+            settings = replace(settings, model=body.model); engine_error = None
+            if previous:
+                try:
+                    await native(previous.close)
+                except Exception:
+                    log.warning('Previous ASR cleanup failed after replacement', exc_info=True)
+            return {'model': settings.model, 'ready': True}
+        except Exception:
+            if candidate:
+                await native(candidate.close)
+            log.exception('ASR change failed')
+            raise HTTPException(status_code=503, detail='ASR model unavailable; run setup.ps1') from None
+        finally:
+            loading = False
 
     @app.get("/pairing", response_class=HTMLResponse)
     async def pairing():
@@ -189,7 +281,7 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
 
     @app.websocket("/audio")
     async def audio_socket(ws: WebSocket):
-        nonlocal busy
+        nonlocal busy, capture_metrics
         if not allowed_origin(ws.headers.get("origin")):
             await ws.close(code=1008)
             return
@@ -200,8 +292,26 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
         outgoing = asyncio.Queue(maxsize=100)
         incoming = asyncio.Queue(maxsize=25)
         loop = asyncio.get_running_loop()
+        metrics = {'framesReceived': 0, 'framesProcessed': 0, 'maxQueuedFrames': 0,
+                   'backpressureEvents': 0, 'maxInferenceMs': 0, 'inferenceSeconds': 0,
+                   'audioSecondsProcessed': 0, 'recovering': False, 'status': 'active'}
+        recovery_started = None
+
+        def recovery(active):
+            nonlocal recovery_started
+            if metrics['recovering'] == active:
+                return
+            metrics['recovering'] = active
+            recovery_started = loop.time() if active else None
+            if active:
+                metrics['backpressureEvents'] += 1
+            enqueue({'type': 'backpressure', 'recovering': active})
 
         def enqueue(message):
+            if message.get('type') == 'caption' and message.get('final'):
+                outputs.caption(session_id, message)
+            elif message.get('type') == 'state':
+                outputs.status(session_id, message['state'])
             if not outgoing.full():
                 outgoing.put_nowait({**message, 'sessionId': session_id})
 
@@ -211,9 +321,13 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
             loop.call_soon_threadsafe(assembler.feed, message)
 
         async def settle():
+            last_saving_failure = False
             while True:
                 await asyncio.sleep(0.1)
                 assembler.tick()
+                if outputs.failed != last_saving_failure:
+                    last_saving_failure = outputs.failed
+                    enqueue({'type': 'saving', 'failed': outputs.failed})
 
         settle_task = None
 
@@ -226,7 +340,15 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
                 kind, payload = await incoming.get()
                 try:
                     if kind == "audio":
+                        before = time.perf_counter()
                         await native(engine.audio, payload, rate)
+                        elapsed = time.perf_counter() - before
+                        metrics['framesProcessed'] += 1
+                        metrics['maxInferenceMs'] = max(metrics['maxInferenceMs'], round(elapsed * 1000))
+                        metrics['inferenceSeconds'] += elapsed
+                        metrics['audioSecondsProcessed'] += len(payload.samples) / rate
+                        if incoming.qsize() <= 6:
+                            recovery(False)
                     elif kind == "pause":
                         await native(engine.pause)
                         assembler.flush()
@@ -236,6 +358,13 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
                     elif kind == "stop":
                         await native(engine.finish)
                         assembler.flush()
+                        recovery(False)
+                        metrics['status'] = 'stopped'
+                        outputs.status(session_id, 'stopped')
+                        saving_failed_before = outputs.failed
+                        await outputs.flush(session_id)
+                        if outputs.failed or saving_failed_before != outputs.failed:
+                            enqueue({'type': 'saving', 'failed': outputs.failed})
                         enqueue({"type": "state", "state": "stopped"})
                         return
                 finally:
@@ -243,7 +372,7 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
 
         try:
             raw = await asyncio.wait_for(ws.receive_text(), timeout=5)
-            if len(raw) > 1000:
+            if len(raw) > 3000:
                 raise ValueError("Hello too large")
             hello = Hello.model_validate_json(raw)
             assembler.hold = hello.sentenceHold
@@ -255,13 +384,18 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
                 await ws.send_json({"type": "error", "message": engine_error})
                 await ws.close(code=1011)
                 return
-            if busy:
+            if busy or loading:
                 await ws.send_json({"type": "error", "message": "Another capture is active. Stop it first."})
                 await ws.close(code=1013)
                 return
             busy = acquired = True
+            if any(len(value) > 500 for value in hello.source.values()):
+                raise ValueError('Source metadata too long')
+            outputs.begin(session_id, hello.autoSave, hello.source, settings.model)
+            capture_metrics = metrics
+            metrics['sampleRate'] = hello.sampleRate
             await native(engine.begin, emit)
-            await ws.send_json({"type": "ready", "sessionId": session_id, "model": settings.model})
+            await ws.send_json({"type": "ready", "sessionId": session_id, "model": settings.model, 'autoSaveSupported': True})
             sender_task = asyncio.create_task(sender())
             settle_task = asyncio.create_task(settle())
             worker_task = asyncio.create_task(worker(hello.sampleRate))
@@ -276,12 +410,25 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
                         raise ValueError("Audio sent while paused")
                     frame = parse_frame(packet["bytes"], hello.sampleRate)
                     order.accept(frame)
-                    # A slow model must not turn a live stream into an ever-growing backlog.
+                    # Browser scheduling can deliver captured worklet frames in
+                    # a burst. Keep the bounded queue and let the worker catch up
+                    # instead of treating the first full queue as a fatal error.
                     if incoming.full():
-                        await ws.send_json({"type": "error", "message": "ASR fell behind by about 2 seconds. Restart or use the small model."})
-                        await ws.close(code=1013)
-                        break
-                    incoming.put_nowait(("audio", frame))
+                        recovery(True)
+                        remaining = AUDIO_RECOVERY_TIMEOUT - (loop.time() - recovery_started)
+                        try:
+                            await asyncio.wait_for(incoming.put(("audio", frame)),
+                                                   timeout=max(0, min(AUDIO_STALL_TIMEOUT, remaining)))
+                        except asyncio.TimeoutError:
+                            metrics['status'] = 'overload'
+                            await ws.send_json({'type': 'error', 'code': 'asr_overload',
+                                'message': '语音识别持续积压，已停止采集。请关闭高负载任务后重新开始；已有字幕已保留。'})
+                            await ws.close(code=1013)
+                            break
+                    else:
+                        incoming.put_nowait(("audio", frame))
+                    metrics['framesReceived'] += 1
+                    metrics['maxQueuedFrames'] = max(metrics['maxQueuedFrames'], incoming.qsize())
                 else:
                     if len(packet.get("text", "")) > 200:
                         raise ValueError("Control too large")
@@ -325,8 +472,21 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
                 if task:
                     await asyncio.gather(task, return_exceptions=True)
             if acquired:
-                await native(engine.finish)
-                busy = False
+                try:
+                    await native(engine.finish)
+                    await asyncio.sleep(0)
+                    assembler.flush()
+                finally:
+                    busy = False
+                    metrics['recovering'] = False
+                    if metrics['status'] == 'active':
+                        metrics['status'] = 'disconnected'
+                    outputs.status(session_id, metrics['status'] if metrics['status'] in {'stopped', 'disconnected'} else 'error')
+                    await outputs.flush(session_id)
+                    duration = metrics['audioSecondsProcessed']
+                    metrics['realTimeFactor'] = round(metrics['inferenceSeconds'] / duration, 3) if duration else None
+                    metrics['inferenceSeconds'] = round(metrics['inferenceSeconds'], 3)
+                    metrics['audioSecondsProcessed'] = round(duration, 3)
 
     return app
 

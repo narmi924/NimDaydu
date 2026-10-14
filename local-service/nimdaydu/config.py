@@ -32,6 +32,11 @@ def load_settings(state_dir: Path | None = None) -> Settings:
     config = json.loads(config_file.read_text(encoding="utf-8"))
     providers_file = state_dir / 'providers.json'
     providers = json.loads(providers_file.read_text(encoding='utf-8')) if providers_file.exists() else {}
-    return Settings(config["token"], os.getenv("NIMDAYDU_MODEL", "small"),
+    model_file = state_dir / 'asr-model.json'
+    selected = json.loads(model_file.read_text(encoding='utf-8-sig')).get('model') if model_file.exists() else None
+    model = selected or os.getenv("NIMDAYDU_MODEL", "small")
+    if model not in {'small', 'medium', 'hybrid'}:
+        raise ValueError('Unsupported NimDaydu ASR model')
+    return Settings(config["token"], model,
                     providers.get('deepseek_key', os.getenv("DEEPSEEK_API_KEY", "")),
                     providers.get('deepseek_model', os.getenv("DEEPSEEK_MODEL", "deepseek-flash")))

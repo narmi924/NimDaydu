@@ -1,6 +1,6 @@
 import { browser } from 'wxt/browser';
 import { SERVICE, readSettings, type Settings } from './types';
-export type Connection = { token: string; ready: boolean; offlineTranslationReady: boolean; deepseekConfigured: boolean; deepseekModel?: string; model: string; version: string; error?: string };
+export type Connection = { token: string; ready: boolean; offlineTranslationReady: boolean; deepseekConfigured: boolean; deepseekModel?: string; model: string; version: string; error?: string; outputDirectory?: string };
 let connecting: Promise<Connection> | undefined;
 export async function connectLocal(): Promise<Connection> {
   if (connecting) return connecting;

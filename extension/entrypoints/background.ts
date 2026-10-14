@@ -1,10 +1,40 @@
 import { browser } from 'wxt/browser';
-import type { Source } from '../lib/types';
+import { readSettings, type Settings, type Snapshot, type Source } from '../lib/types';
 import { identifySource } from '../lib/source';
 
 export default defineBackground(() => {
   let source: Source | undefined;
   let creating: Promise<void> | undefined;
+  let starting = false;
+
+  async function offscreenSnapshot(): Promise<Snapshot> {
+    // createDocument resolving does not prove the module listener is ready.
+    // Never interpret a missing reply as an idle session.
+    for (let attempt = 0; attempt < 12; attempt++) {
+      let cancelTimeout = () => {};
+      try {
+        const result = await Promise.race([
+          browser.runtime.sendMessage({ target: 'offscreen', type: 'snapshot' }),
+          new Promise<undefined>(resolve => {
+            const timeout = setTimeout(() => resolve(undefined), 200);
+            cancelTimeout = () => clearTimeout(timeout);
+          }),
+        ]);
+        if (result?.state && ['idle', 'starting', 'capturing', 'paused', 'stopping', 'stopped', 'error'].includes(result.state.phase)
+          && Array.isArray(result.captions)) return result as Snapshot;
+      } catch { /* A just-created document may not have registered yet. */ }
+      finally { cancelTimeout(); }
+      if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    throw new Error('采音页面未能就绪，请在扩展管理页重新加载 NimDaydu 后重试。');
+  }
+
+  browser.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.settings?.newValue) return;
+    const settings = readSettings(changes.settings.newValue as Partial<Settings>);
+    if (settings.autoSave === readSettings(changes.settings.oldValue as Partial<Settings> | undefined).autoSave) return;
+    void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', autoSave: settings.autoSave }).catch(() => {});
+  });
 
   async function ensureOffscreen() {
     if (await browser.offscreen.hasDocument()) return;
@@ -35,19 +65,27 @@ export default defineBackground(() => {
       }
       if (message.type === 'snapshot') {
         if (!(await browser.offscreen.hasDocument())) return { state: { phase: 'idle' }, captions: [] };
-        return browser.runtime.sendMessage({ target: 'offscreen', type: 'snapshot' });
+        return offscreenSnapshot();
       }
       if (message.type === 'start') {
-        source ??= (await browser.storage.session.get('source')).source as Source | undefined;
-        if (!source) throw new Error('请在声音所在网页点击 NimDaydu 图标。');
-        const tab = await browser.tabs.get(source.tabId).catch(() => { throw new Error('来源标签页已关闭，请在声音所在网页重新点击插件图标。'); });
-        if (!tab.url || !/^https?:/.test(tab.url)) throw new Error('请在会议、直播或视频网页中开始。');
-        source = { ...source, title: tab.title || source.title, ...identifySource(tab.url) };
-        await ensureOffscreen();
-        const snapshot = await browser.runtime.sendMessage({ target: 'offscreen', type: 'snapshot' });
-        if (['starting', 'capturing', 'paused', 'stopping'].includes(snapshot.state.phase)) throw new Error('已有字幕会话，请先停止。');
-        const streamId = await browser.tabCapture.getMediaStreamId({ targetTabId: source.tabId });
-        return browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, viewId: message.viewId, canTranslate: message.canTranslate, sentenceHold: message.sentenceHold });
+        if (starting) throw new Error('字幕正在启动，请稍候。');
+        starting = true;
+        try {
+          source ??= (await browser.storage.session.get('source')).source as Source | undefined;
+          if (!source) throw new Error('请在声音所在网页点击 NimDaydu 图标。');
+          const tab = await browser.tabs.get(source.tabId).catch(() => { throw new Error('来源标签页已关闭，请在声音所在网页重新点击插件图标。'); });
+          if (!tab.url || !/^https?:/.test(tab.url)) throw new Error('请在会议、直播或视频网页中开始。');
+          source = { ...source, title: tab.title || source.title, ...identifySource(tab.url) };
+          await ensureOffscreen();
+          const snapshot = await offscreenSnapshot();
+          if (['starting', 'capturing', 'paused', 'stopping'].includes(snapshot.state.phase)) throw new Error('已有字幕会话，请先停止。');
+          const streamId = await browser.tabCapture.getMediaStreamId({ targetTabId: source.tabId });
+          const settings = readSettings((await browser.storage.local.get('settings')).settings as Partial<Settings> | undefined);
+          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, viewId: message.viewId, canTranslate: message.canTranslate, sentenceHold: message.sentenceHold, autoSave: settings.autoSave });
+          if (result?.error) throw new Error(result.error);
+          if (!result?.ok) throw new Error('采音页面没有确认启动，请重新打开侧栏后重试。');
+          return result;
+        } finally { starting = false; }
       }
       if (message.type === 'badge') {
         await browser.action.setBadgeText({ text: message.phase === 'capturing' ? 'ON' : message.phase === 'paused' ? 'Ⅱ' : '' });

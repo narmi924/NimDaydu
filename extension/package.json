@@ -1,7 +1,7 @@
 {
   "name": "nimdaydu-extension",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.5.1",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -16,11 +16,12 @@
     "react-dom": "19.3.0"
   },
   "devDependencies": {
-    "wxt": "0.21.4",
-    "@wxt-dev/module-react": "1.2.2",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@wxt-dev/module-react": "1.2.2",
+    "happy-dom": "21.0.1",
     "typescript": "^5.9",
-    "vitest": "^4"
+    "vitest": "^4",
+    "wxt": "0.21.4"
   }
 }

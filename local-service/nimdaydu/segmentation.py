@@ -2,6 +2,7 @@
 
 No generated words: merge recognized fragments, normalize whitespace and
 punctuation, and publish immutable sentences after a short settling window.
+Publish revisioned English previews immediately, outside the translation flow.
 """
 import re
 import time
@@ -74,6 +75,32 @@ class SentenceAssembler:
         self.paragraph_size = 0
         self.last_end = None
         self.pending = False
+        self.preview_revision = 0
+        self.last_preview = ('', 0, 0)
+
+    def _preview_snapshot(self):
+        lines = list(self.lines.values())
+        text = ''
+        previous = None
+        for line in lines:
+            if text and previous and line['start'] - previous['end'] <= 1.5 and continuation(text, line['text']):
+                text = join_fragments(text, line['text'])
+            else:
+                text = (text + ' ' + line['text']).strip()
+            previous = line
+        value = (text, lines[0]['start'] if lines else 0, lines[-1]['end'] if lines else 0)
+        if value != self.last_preview:
+            self.preview_revision += 1
+            self.last_preview = value
+        return {'revision': self.preview_revision, 'text': value[0], 'start': value[1], 'end': value[2]}
+
+    def _publish_preview(self):
+        previous_revision = self.preview_revision
+        snapshot = self._preview_snapshot()
+        if snapshot['revision'] != previous_revision:
+            # English updates never enter the translation queue. A settled
+            # caption later replaces the matching preview in one event.
+            self.emit({'type': 'preview', **snapshot})
 
     def _pending(self):
         value = bool(self.lines)
@@ -82,6 +109,14 @@ class SentenceAssembler:
             self.emit({'type': 'pending', 'pending': value})
 
     def feed(self, message):
+        if message.get('type') == 'retract':
+            line = self.lines.get(message['id'])
+            if line and not line['final'] and message['revision'] > line['revision']:
+                self.lines.pop(message['id'])
+                self._pending()
+                self._publish_preview()
+                self.tick()
+            return
         if message.get('type') != 'caption':
             self.emit(message)
             return
@@ -122,6 +157,7 @@ class SentenceAssembler:
         else:
             self.lines[identifier] = normalized
         self._pending()
+        self._publish_preview()
         self.tick()
 
     def tick(self):
@@ -165,13 +201,14 @@ class SentenceAssembler:
         self.counter += 1
         self.paragraph_size += 1
         self.last_end = last['end']
-        self.emit({'type': 'caption', 'id': f'sentence:{self.counter}', 'revision': 1, 'final': True,
-                   'text': text, 'start': first['start'], 'end': last['end'], 'paragraph': self.paragraph,
-                   'incomplete': incomplete, 'rawText': [line['text'] for line in group],
-                   'inferenceMs': max(line.get('inferenceMs', 0) for line in group)})
         for line in group:
             self.lines.pop(line['id'], None)
             self.committed.add(line['id'])
+        self.emit({'type': 'caption', 'id': f'sentence:{self.counter}', 'revision': 1, 'final': True,
+                   'text': text, 'start': first['start'], 'end': last['end'], 'paragraph': self.paragraph,
+                   'incomplete': incomplete, 'rawText': [line['text'] for line in group],
+                   'inferenceMs': max(line.get('inferenceMs', 0) for line in group),
+                   'preview': self._preview_snapshot()})
         self._pending()
 
     def flush(self):

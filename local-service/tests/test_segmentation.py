@@ -17,9 +17,11 @@ def captions(emitted):
     return [event for event in emitted if event['type'] == 'caption']
 
 
-def test_drafts_never_escape_and_final_sentence_waits_to_settle():
+def test_english_drafts_are_immediate_but_translation_sentences_wait_to_settle():
     assembler, now, emitted = setup()
     assembler.feed(line('a', 'Open the', final=False))
+    preview = next(event for event in emitted if event['type'] == 'preview')
+    assert preview['text'] == 'Open the' and preview['revision'] == 1
     now[0] = 2
     assembler.tick()
     assert not captions(emitted)
@@ -30,7 +32,26 @@ def test_drafts_never_escape_and_final_sentence_waits_to_settle():
     now[0] = 2.9
     assembler.tick()
     assert captions(emitted)[0]['text'] == 'Open the application form.'
+    assert captions(emitted)[0]['preview']['text'] == ''
     assert emitted[-1] == {'type': 'pending', 'pending': False}
+
+
+def test_preview_revision_replaces_words_and_commit_retires_only_its_own_words():
+    assembler, now, emitted = setup()
+    assembler.feed(line('a', 'Open the from', final=False))
+    assembler.feed(line('a', 'Open the form.', revision=2))
+    assembler.feed(line('b', 'Then check the', final=False, start=1.2, end=2))
+    previews = [event for event in emitted if event['type'] == 'preview']
+    assert previews[1]['text'] == 'Open the form.'
+    assert previews[-1]['text'] == 'Open the form. Then check the'
+    now[0] = .9
+    assembler.tick()
+    committed = captions(emitted)[0]
+    assert committed['text'] == 'Open the form.'
+    assert committed['preview']['text'] == 'Then check the'
+    assert committed['preview']['revision'] > previews[-1]['revision']
+    assembler.feed(line('a', 'Late incorrect revision.', revision=100))
+    assert len(captions(emitted)) == 1
 
 
 def test_short_prefix_and_continuation_form_one_sentence():

@@ -2,13 +2,14 @@ import { expect, it } from 'vitest';
 import { groupParagraphs, readableCaptions } from './reader';
 import { DEFAULT_SETTINGS, applyTranslation, readSettings, type Caption } from './types';
 const caption = (id: string, paragraph = 1): Caption => ({ id, paragraph, sessionId: 'one', text: 'A complete sentence.', final: true, revision: 1, start: 0, end: 1 });
-it('does not display drafts or unfinished translations and preserves reading order', () => {
+it('displays settled English without waiting for Chinese, preserving reading order', () => {
   const first = { ...caption('a'), translation: '完整语句。', translationRevision: 1 };
   const second = caption('b');
   const third = { ...caption('c'), translation: '第三句。', translationRevision: 1 };
-  expect(readableCaptions([first, second, third], true)).toEqual([first]);
-  expect(readableCaptions([{ ...first, final: false }, second], false)).toEqual([second]);
-  expect(readableCaptions([first, second, third], true, true)).toHaveLength(3);
+  expect(readableCaptions([first, second, third], 'bilingual')).toEqual([first, second, third]);
+  expect(readableCaptions([first, second, third], 'translated')).toEqual([first]);
+  expect(readableCaptions([{ ...first, final: false }, second], 'original')).toEqual([second]);
+  expect(readableCaptions([first, second, third], 'translated', true)).toHaveLength(3);
 });
 it('groups settled sentences by paragraph while preserving original sentences', () => {
   const input = [caption('a'), caption('b'), caption('c', 2)];

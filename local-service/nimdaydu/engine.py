@@ -47,12 +47,21 @@ class MoonshineEngine:
         if isinstance(event, Error):
             self.emit({"type": "error", "message": "Local speech engine failed. Stop and restart capture."})
             return
-        if not isinstance(event, (LineTextChanged, LineCompleted)) or not event.line.text.strip():
+        if not isinstance(event, (LineTextChanged, LineCompleted)):
             return
         line = event.line
         segment_id = f"{self.epoch}:{line.line_id}"
         final = isinstance(event, LineCompleted) or line.is_complete
         previous = self.revisions.get(segment_id)
+        if not line.text.strip():
+            # The acoustic model can retract a provisional hypothesis by
+            # completing it with empty text (common with noisy game audio).
+            # Ignoring that event leaves an eternal draft ahead of good lines.
+            if previous and not previous[1] and (previous[0] or final):
+                revision = previous[2] + 1
+                self.revisions[segment_id] = ('', final, revision)
+                self.emit({'type': 'retract', 'id': segment_id, 'revision': revision})
+            return
         if previous and previous[0] == line.text and previous[1] == final:
             return
         revision = previous[2] + 1 if previous else 1

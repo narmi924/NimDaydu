@@ -1,33 +1,29 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { browser } from 'wxt/browser';
-import { applyTranslation, isActive, mergeCaption, readSettings, DEFAULT_SETTINGS, timestamp,
-  type Caption, type CaptureState, type Settings, type Source, type ViewMode } from '../../lib/types';
-import { serviceTranslate, LocalTranslator, TranslationQueue } from '../../lib/translation';
+import { applyTranslation, isActive, mergeCaption, mergePreview, readSettings, DEFAULT_SETTINGS, timestamp,
+  type Caption, type CaptureState, type EnglishPreview, type Settings, type Source } from '../../lib/types';
+import { serviceTranslate, LocalTranslator, TranslationQueue, type TranslationStatus } from '../../lib/translation';
 import { connectLocal, type Connection } from '../../lib/connection';
-import { readableCaptions, groupParagraphs, type Paragraph } from '../../lib/reader';
+import { readableCaptions, groupParagraphs } from '../../lib/reader';
+import { EnglishPreviewRow, ParagraphRow } from '../../lib/CaptionReader';
 import { exportCaptions } from '../../lib/export';
+import { exportDiagnostics } from '../../lib/export-diagnostics';
 import Icon from '../../lib/Icon';
 
 const PHASE_LABELS = { idle: '未开始', starting: '连接中', capturing: '正在聆听', paused: '已暂停', stopping: '正在结束', stopped: '已结束', error: '已断开' };
-
-const ParagraphRow = memo(function ParagraphRow({ paragraph, mode }: { paragraph: Paragraph; mode: ViewMode }) {
-  const translated = paragraph.captions.map(c => c.translation).filter(Boolean).join('');
-  return <article className="paragraph">
-    <div className="paragraph-meta"><time>{timestamp(paragraph.captions[0]!.start)}</time>{paragraph.captions.some(c => c.incomplete) && <span>语句未完</span>}</div>
-    {mode !== 'original' && translated && <p className="chinese" lang="zh-CN">{translated}</p>}
-    {(mode !== 'translated' || !translated) && <p className={mode === 'original' || !translated ? 'english only' : 'english'} lang="en">{paragraph.captions.map(c => c.text).join(' ')}</p>}
-  </article>;
-});
 
 export default function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [source, setSource] = useState<Source>();
   const [state, setState] = useState<CaptureState>({ phase: 'idle' });
   const [captions, setCaptions] = useState<Caption[]>([]);
+  const [preview, setPreview] = useState<EnglishPreview>();
   const [connection, setConnection] = useState<Connection>();
   const [connectionError, setConnectionError] = useState('');
   const [notice, setNotice] = useState('');
   const [translationFailed, setTranslationFailed] = useState(false);
+  const [translationStatus, setTranslationStatus] = useState<TranslationStatus>({ pending: 0, failed: 0, retrying: 0, running: false });
+  const [repairing, setRepairing] = useState(false);
   const [checking, setChecking] = useState(true);
   const [working, setWorking] = useState(false);
   const [menu, setMenu] = useState(false);
@@ -39,7 +35,6 @@ export default function App() {
   const captionsRef = useRef(captions);
   const stateRef = useRef(state);
   const connectionRef = useRef(connection);
-  const errorRef = useRef(false);
   const ownerRef = useRef(false);
   const viewId = useRef(crypto.randomUUID());
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -52,30 +47,31 @@ export default function App() {
 
   const sendOffscreen = useCallback((message: Record<string, unknown>) => browser.runtime.sendMessage({ target: 'offscreen', ...message }), []);
   const canTranslate = useCallback(() => {
-    if (errorRef.current) return false;
     switch (settingsRef.current.translationMode) {
       case 'offline': return Boolean(connectionRef.current?.offlineTranslationReady);
       case 'deepseek': return Boolean(connectionRef.current?.deepseekConfigured);
-      case 'local': return Boolean(translatorRef.current?.ready);
+      // Keep the translation lease during instance recreation. Recovery must
+      // not discard this view's queue or stop unrelated audio capture.
+      case 'local': return Boolean(window.Translator);
       default: return false;
     }
   }, []);
 
-  if (!queueRef.current) queueRef.current = new TranslationQueue(async caption => {
+  if (!queueRef.current) queueRef.current = new TranslationQueue(async (caption, signal) => {
     const config = settingsRef.current;
-    if (config.translationMode === 'local') return translatorRef.current!.translate(caption.text);
-    if (config.translationMode === 'offline') return serviceTranslate(caption.text, config.token, [], 'offline');
+    if (config.translationMode === 'local') return translatorRef.current!.translate(caption.text, signal);
+    if (config.translationMode === 'offline') return serviceTranslate(caption.text, config.token, [], 'offline', signal);
     if (config.translationMode === 'deepseek') {
       const context = captionsRef.current.filter(c => c.final && c.start < caption.start).slice(-2).map(c => c.text);
-      return serviceTranslate(caption.text, config.token, context, 'deepseek');
+      return serviceTranslate(caption.text, config.token, context, 'deepseek', signal);
     }
     throw new Error('翻译已关闭');
-  }, (caption, text) => {
-    void sendOffscreen({ type: 'translation', viewId: viewId.current, sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text });
-  }, error => {
-    errorRef.current = true; setTranslationFailed(true);
-    setNotice(error instanceof Error ? error.message : '翻译暂不可用，英文字幕已保留。');
-  });
+  }, async (caption, text) => {
+    const result = await sendOffscreen({ type: 'translation', viewId: viewId.current, sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text });
+    if (!result?.ok) throw new Error('字幕视图已切换，译文等待重新投递。');
+  }, () => {}, { onChange: status => {
+    setTranslationStatus(status); setTranslationFailed(status.failed > 0);
+  } });
 
   const queueCaption = useCallback((caption: Caption) => {
     if (!ownerRef.current || !canTranslate() || caption.translationRevision === caption.revision) return;
@@ -107,21 +103,26 @@ export default function App() {
       else if (message.type === 'state') {
         const next: CaptureState = message.state;
         if (next.phase === 'starting') {
-          setCaptions([]); queueRef.current!.reset(); setFollowing(true);
-          errorRef.current = false; setTranslationFailed(false);
+          setCaptions([]); setPreview(undefined); queueRef.current!.reset(); setFollowing(true);
+          setTranslationFailed(false);
         }
-        setState(next);
+        stateRef.current = next; setState(next);
       } else if (message.type === 'caption' && message.caption.final) {
-        setCaptions(previous => mergeCaption(previous, message.caption)); queueCaption(message.caption);
+        if (message.caption.sessionId !== stateRef.current.sessionId) return;
+        setCaptions(previous => mergeCaption(previous, message.caption));
+        if (message.preview) setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
+        queueCaption(message.caption);
+      } else if (message.type === 'preview' && message.preview) {
+        setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
       } else if (message.type === 'translation') setCaptions(previous => applyTranslation(previous, message));
-      else if (message.type === 'cleared') { setCaptions([]); queueRef.current!.reset(); }
+      else if (message.type === 'cleared') { setCaptions([]); setPreview(undefined); queueRef.current!.reset(); }
     };
     const storageListener = (changes: any, area: string) => {
       if (area !== 'local' || !changes.settings?.newValue) return;
       const next = readSettings(changes.settings.newValue);
       if (next.translationMode !== settingsRef.current.translationMode || next.token !== settingsRef.current.token) {
         queueRef.current!.reset(); ownerRef.current = false;
-        errorRef.current = false; setTranslationFailed(false); setNotice('');
+        translatorRef.current!.destroy(); setTranslationFailed(false); setNotice('');
         void connect();
         if (next.translationMode === 'local' && !translatorRef.current!.ready) {
           void translatorRef.current!.availability().then(availability => {
@@ -144,7 +145,7 @@ export default function App() {
       ]);
       if (!mounted) return;
       setSource(selection?.source);
-      if (snapshot?.state) { setState(snapshot.state); setCaptions(snapshot.captions || []); }
+      if (snapshot?.state) { stateRef.current = snapshot.state; setState(snapshot.state); setCaptions(snapshot.captions || []); setPreview(snapshot.preview); }
       await connect();
       if (initial.translationMode === 'local' && await translatorRef.current!.availability() === 'available') {
         await translatorRef.current!.prepare(() => {});
@@ -176,8 +177,8 @@ export default function App() {
   }, [state.phase, state.startedAt]);
 
   useEffect(() => {
-    if (following && captions.length && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-  }, [captions, following]);
+    if (following && (captions.length || preview?.text) && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [captions, preview, following]);
 
   useEffect(() => {
     if (!menu) return;
@@ -190,7 +191,7 @@ export default function App() {
   async function start() {
     const localPreparation = settingsRef.current.translationMode === 'local'
       ? translatorRef.current!.prepare(() => {}) : Promise.resolve();
-    setWorking(true); setNotice(''); errorRef.current = false; setTranslationFailed(false);
+    setWorking(true); setNotice(''); setTranslationFailed(false);
     try {
       await localPreparation;
       const next = await connect();
@@ -213,14 +214,30 @@ export default function App() {
     finally { setWorking(false); }
   }
 
+  async function repairTranslation() {
+    setRepairing(true); setNotice('');
+    // Retain successful captions and the audio session. Only repair this queue.
+    try {
+      if (settingsRef.current.translationMode === 'local') await translatorRef.current!.prepare(() => {});
+      else await connect();
+      queueRef.current!.retryFailed();
+      captionsRef.current.forEach(queueCaption);
+    } catch { setNotice('翻译暂未恢复，请在设置中检查语言包或本机连接。英文字幕仍保留。'); }
+    finally { setRepairing(false); }
+  }
+
   const mode = settings.translationMode === 'off' ? 'original' : settings.viewMode;
-  const readable = useMemo(() => readableCaptions(captions, mode !== 'original', translationFailed), [captions, mode, translationFailed]);
+  const readable = useMemo(() => readableCaptions(captions, mode, translationFailed), [captions, mode, translationFailed]);
   const visible = useMemo(() => search.trim() ? readable.filter(c => `${c.text} ${c.translation || ''}`.toLowerCase().includes(search.trim().toLowerCase())) : readable, [readable, search]);
   const paragraphs = useMemo(() => groupParagraphs(visible), [visible]);
   const active = isActive(state.phase);
   const currentSource = active ? state.source : source || state.source;
-  const waitingTranslation = captions.length > readable.length;
-  const pendingLabel = waitingTranslation ? '正在翻译…' : active && state.pending ? '正在整理下一句…' : '';
+  const waitingTranslation = !translationFailed && mode !== 'original' && captions.some(c => c.translationRevision !== c.revision);
+  const pendingLabel = waitingTranslation ? '正在翻译…' : active && state.pending && mode !== 'original' ? '正在整理译文…' : '';
+  const translationMessage = translationStatus.failed > 0
+    ? `${translationStatus.failed} 句译文待恢复。${active ? '英文转录继续。' : '英文字幕已保留。'}`
+    : translationStatus.retrying > 0 ? `翻译正在重试。${active ? '英文转录继续。' : '英文字幕已保留。'}` : '';
+  const visiblePreview = !search.trim() && mode !== 'translated' && preview?.text;
 
   return <div className="app" style={{ '--caption-size': `${settings.fontSize}px` } as CSSProperties}>
     <header className="header">
@@ -233,6 +250,7 @@ export default function App() {
             <button role="menuitem" onClick={() => { setSearching(true); setMenu(false); }}>搜索字幕</button>
             <button role="menuitem" aria-label="导出双语 TXT" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'txt'); setMenu(false); }}>导出 TXT</button>
             <button role="menuitem" aria-label="导出字幕 JSON" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'json'); setMenu(false); }}>导出 JSON</button>
+            <button role="menuitem" onClick={() => { void exportDiagnostics(translationStatus); setMenu(false); }}>导出诊断</button>
             <div className="menu-divider"/>
             <button role="menuitem" disabled={active || !captions.length} onClick={() => void control('clear')}>清空字幕</button>
           </div>}
@@ -241,23 +259,24 @@ export default function App() {
     </header>
     <section className="session" aria-label="当前来源">
       <div className="source"><span className="site">{currentSource?.site || '网页'}</span><span className="source-title" title={currentSource?.title}>{currentSource?.title || '在声音所在标签页点击插件图标'}</span></div>
-      <div className="session-meta"><span className={`status-dot ${state.phase}`}/><span>{PHASE_LABELS[state.phase]}</span>{state.startedAt && <time>{timestamp(elapsed)}</time>}<span className="languages">EN → 中文</span></div>
+      <div className="session-meta"><span className={`status-dot ${state.phase}`}/><span>{state.phase === 'capturing' && state.recovering ? '正在追赶' : PHASE_LABELS[state.phase]}</span>{state.startedAt && <time>{timestamp(elapsed)}</time>}<span className="languages">EN → 中文</span></div>
     </section>
-    {(notice || state.message) && <div className="notice" role="status"><p>{notice || state.message}</p>{notice && <button className="icon-button small" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="close" size={14}/></button>}</div>}
+    {(notice || state.saveError || state.message || translationMessage) && <div className="notice" role="status"><p>{notice || state.saveError || state.message || translationMessage}</p>{translationStatus.failed > 0 && <button className="text-button" disabled={repairing} onClick={() => void repairTranslation()}>{repairing ? '恢复中…' : '恢复翻译'}</button>}{notice && <button className="icon-button small" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="close" size={14}/></button>}</div>}
     {searching && <div className="search-row"><Icon name="search" size={16}/><input aria-label="搜索字幕" placeholder="搜索字幕" value={search} autoFocus onChange={e => setSearch(e.target.value)} onKeyDown={e => { if (e.key === 'Escape') { setSearching(false); setSearch(''); } }}/><button className="icon-button small" aria-label="关闭搜索" onClick={() => { setSearching(false); setSearch(''); }}><Icon name="close" size={14}/></button></div>}
     <div className="transcript" aria-label="双语字幕" ref={scrollRef} onScroll={() => {
       const element = scrollRef.current;
       if (element) setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 70);
     }}>
       {paragraphs.map(paragraph => <ParagraphRow key={paragraph.id} paragraph={paragraph} mode={mode}/>)}
-      {!visible.length && <div className="empty-state">
-        <p className="empty-title">{search ? '没有匹配的字幕' : active ? '等待完整语句' : checking ? '正在连接本机服务' : connectionError ? '本机服务未连接' : '开始后显示双语字幕'}</p>
-        {!search && <p>{active ? '句子整理和翻译完成后会显示在这里。' : connectionError || '播放网页中的声音，然后点击开始。'}</p>}
+      {visiblePreview && <EnglishPreviewRow preview={preview} mode={mode}/>}
+      {!visible.length && !visiblePreview && <div className="empty-state">
+        <p className="empty-title">{search ? '没有匹配的字幕' : active ? mode === 'translated' ? '等待完整译文' : '等待语音' : checking ? '正在连接本机服务' : connectionError ? '本机服务未连接' : '开始后显示双语字幕'}</p>
+        {!search && <p>{active ? mode === 'translated' ? '句子整理和翻译完成后会显示在这里。' : '英文实时显示，中文在句子完成后更新。' : connectionError || '播放网页中的声音，然后点击开始。'}</p>}
         {!active && connectionError && <button className="text-button" onClick={() => { setChecking(true); void connect(); }}>重新连接</button>}
       </div>}
       {pendingLabel && !search && <div className="pending" role="status"><span className="pending-dot"/>{pendingLabel}</div>}
     </div>
-    {!following && readable.length > 0 && <button className="back-to-live" onClick={() => { setSearch(''); setFollowing(true); }}><Icon name="arrow" size={14}/>回到最新</button>}
+    {!following && (readable.length > 0 || visiblePreview) && <button className="back-to-live" onClick={() => { setSearch(''); setFollowing(true); }}><Icon name="arrow" size={14}/>回到最新</button>}
     <footer className="controls">
       {!active ? <button className="button primary" onClick={() => void start()} disabled={working || checking || !source}><Icon name="play" size={16}/>{working ? '连接中…' : '开始'}</button>
         : <><button className="button primary" onClick={() => void control(state.phase === 'paused' ? 'resume' : 'pause')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name={state.phase === 'paused' ? 'play' : 'pause'} size={16}/>{state.phase === 'paused' ? '继续' : '暂停'}</button><button className="button stop" onClick={() => void control('stop')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name="stop" size={16}/>结束</button></>}
