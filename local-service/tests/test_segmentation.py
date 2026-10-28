@@ -137,3 +137,52 @@ def test_date_continuation_gets_time_to_arrive_and_topic_marker_stays_separate()
     assembler.tick()
     assert [c['text'] for c in captions(emitted)] == ['The deadline is Friday, October ninth.', 'Next, We will review the code.']
     assert captions(emitted)[0]['paragraph'] != captions(emitted)[1]['paragraph']
+
+
+def test_long_sentence_becomes_clause_units_that_translate_separately():
+    assembler, now, emitted = setup()
+    text = ("I don't want to make you guys wait until the very end of this super long video to talk "
+            "about the trade cash cups, so I'll put it up the front.")
+    assembler.feed(line('a', text, end=6))
+    now[0] = 1
+    assembler.tick()
+    units = captions(emitted)
+    assert [unit['text'] for unit in units] == [
+        "I don't want to make you guys wait until the very end of this super long video to talk about the trade cash cups,",
+        "so I'll put it up the front."]
+    assert [unit['continued'] for unit in units] == [True, False]
+    assert units[0]['paragraph'] == units[1]['paragraph']
+    assert units[0]['start'] == 0 and units[0]['end'] == units[1]['start'] and units[1]['end'] == 6
+    assert units[0]['rawText'] == [text] and units[1]['rawText'] == []
+    # Only the last unit retires the preview, so the reader replaces it once.
+    assert 'preview' not in units[0] and units[1]['preview']['text'] == ''
+
+
+def test_short_sentences_and_unbreakable_clauses_stay_whole():
+    from nimdaydu.segmentation import split_units
+    assert split_units('Make a huge comeback on day number two.') == ['Make a huge comeback on day number two.']
+    run_on = 'We spent the whole afternoon reviewing every single field in the booking form together yesterday.'
+    assert split_units(run_on) == [run_on]
+    parts = split_units("They kind of come into Twitch streamers' chats, or they kind of interact with more people "
+                        'on Twitter and kind of announce things in these more informal ways.')
+    assert all(len(part.split()) <= 16 for part in parts) and len(parts) == 3
+
+
+def test_live_preview_is_already_cut_into_stable_rows():
+    from nimdaydu.segmentation import split_units
+    assembler, now, emitted = setup()
+    assembler.feed(line('a', 'Check availability. It is like after you select the package, it shows the departure', final=False))
+    preview = [event for event in emitted if event['type'] == 'preview'][-1]
+    assert preview['units'] == ['Check availability.', 'It is like after you select the package, it shows the departure']
+    # Rows already cut never move as the speaker continues.
+    spoken = ("It is like after you select the package, it shows the departure, and then you select the tour group "
+              "because the tour group is based on the departure date.")
+    words = spoken.split()
+    previous = []
+    for size in range(1, len(words) + 1):
+        units = split_units(' '.join(words[:size]))
+        # Only the trailing row may still grow or split; finished rows are kept.
+        assert units[:len(previous) - 1] == previous[:-1]
+        previous = units
+    assert split_units(spoken) == ['It is like after you select the package,', 'it shows the departure, and then you select the tour group',
+                                   'because the tour group is based on the departure date.']

@@ -27,7 +27,7 @@ def main():
                 last[0] = time.monotonic()
 
         path, arch = get_model_for_language("en", ARCHES[name], cache_root=directory, on_progress=progress)
-        manifest[name] = {"path": str(Path(path).relative_to(ROOT)), "arch": int(arch)}
+        manifest[name] = {"path": Path(path).relative_to(ROOT).as_posix(), "arch": int(arch)}
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         print(f"{name}: ready", flush=True)
 

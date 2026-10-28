@@ -5,6 +5,7 @@ const runtime = vi.hoisted(() => ({ listener: undefined as any }));
 vi.mock('wxt/browser', () => ({ browser: { runtime: {
   id: 'nimdaydu-test', sendMessage: async () => ({}),
   onMessage: { addListener: (listener: any) => { runtime.listener = listener; } },
+  onConnect: { addListener() {} },
 } } }));
 
 it('boots with the actual offscreen API surface and answers the startup snapshot', async () => {

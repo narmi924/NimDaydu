@@ -46,3 +46,57 @@ def test_empty_late_event_does_not_revoke_already_finalized_words():
     speech._event(event(1, 'The final spoken sentence.', True))
     speech._event(event(1, '', True))
     assert len(events) == 1 and events[0]['final']
+
+
+class Stream:
+    def __init__(self, cost):
+        self.cost = cost
+        self.passes = []
+        self.audio = 0
+
+    def add_audio(self, samples, rate):
+        self.audio += len(samples)
+
+    def update_transcription(self):
+        self.passes.append(self.audio)
+        self.cost[1] += self.cost[0]
+
+
+def scheduled(monkeypatch, seconds_per_pass):
+    clock = [0.0, 0.0]
+    cost = [seconds_per_pass, 0.0]
+    monkeypatch.setattr('nimdaydu.engine.time.perf_counter', lambda: cost[1])
+    speech = engine(lambda _: None)
+    speech.stream = Stream(cost)
+    speech.stream_seconds = speech.updated_at = speech.last_pass = 0.0
+    return speech, speech.stream
+
+
+def frames(speech, count, behind=False):
+    from nimdaydu.protocol import AudioFrame
+    import numpy as np
+    for index in range(count):
+        speech.audio(AudioFrame(index, index * 1280, np.zeros(1280, dtype=np.float32)), 16000, behind)
+
+
+def test_cheap_draft_passes_keep_the_half_second_floor(monkeypatch):
+    speech, stream = scheduled(monkeypatch, .05)
+    frames(speech, 50)  # 4 s of audio in 80 ms frames
+    # The first frame at or past each 0.5 s mark runs a pass.
+    assert stream.passes == [7 * 1280 * n for n in range(1, 8)]
+
+
+def test_expensive_passes_leave_headroom_instead_of_pinning_a_core(monkeypatch):
+    speech, stream = scheduled(monkeypatch, 1.2)
+    frames(speech, 125)  # 10 s of audio
+    gaps = [b - a for a, b in zip(stream.passes, stream.passes[1:])]
+    # Each pass waits for 1.5x its own cost in audio: at most 2/3 of a core.
+    assert all(gap / 16000 >= 1.8 - .08 for gap in gaps)
+
+
+def test_backlog_skips_draft_passes_until_caught_up(monkeypatch):
+    speech, stream = scheduled(monkeypatch, .05)
+    frames(speech, 40, behind=True)
+    assert stream.passes == []
+    frames(speech, 1)
+    assert stream.passes == [41 * 1280]

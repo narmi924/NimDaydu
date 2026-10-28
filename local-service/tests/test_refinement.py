@@ -10,7 +10,7 @@ class Draft:
     def __init__(self, model):
         self.emit = lambda _: None
     def begin(self, emit): self.emit = emit
-    def audio(self, frame, rate): pass
+    def audio(self, frame, rate, behind=False): pass
     def pause(self): pass
     def finish(self): pass
     def close(self): pass
@@ -160,3 +160,17 @@ def test_retracted_live_tail_releases_the_held_acoustic_predecessor():
     assert not assembler.lines
     assert [event['text'] for event in events if event['type'] == 'caption'] == ['The acoustic result.']
     engine.close()
+
+
+def test_overlapping_regions_do_not_repeat_boundary_words():
+    from nimdaydu.refinement import drop_repeated_start
+    assert drop_repeated_start('we open the booking', 'the booking form opens.') == 'Form opens.'
+    assert drop_repeated_start('we open the booking', 'Booking') == 'Booking'
+    assert drop_repeated_start('we open the form', 'and then we pay.') == 'and then we pay.'
+    engine = RefinedEngine.__new__(RefinedEngine)
+    engine.last_final = None
+    first = engine._final({'id': 'a', 'revision': 1, 'start': 0, 'end': 10.4}, 'Then we open the booking')
+    second = engine._final({'id': 'b', 'revision': 1, 'start': 9.9, 'end': 14}, 'the booking form opens.')
+    later = engine._final({'id': 'c', 'revision': 1, 'start': 15, 'end': 16}, 'Form opens again.')
+    assert first['text'] == 'Then we open the booking' and second['text'] == 'Form opens.'
+    assert later['text'] == 'Form opens again.' and later['final'] and later['revision'] == 2

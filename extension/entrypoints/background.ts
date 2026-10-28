@@ -32,8 +32,42 @@ export default defineBackground(() => {
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !changes.settings?.newValue) return;
     const settings = readSettings(changes.settings.newValue as Partial<Settings>);
-    if (settings.autoSave === readSettings(changes.settings.oldValue as Partial<Settings> | undefined).autoSave) return;
-    void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', autoSave: settings.autoSave }).catch(() => {});
+    const previous = readSettings(changes.settings.oldValue as Partial<Settings> | undefined);
+    if (settings.autoSave !== previous.autoSave) {
+      void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', autoSave: settings.autoSave }).catch(() => {});
+    }
+    if (settings.translationMode !== previous.translationMode) {
+      void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', translationMode: settings.translationMode }).catch(() => {});
+    }
+  });
+
+  /** Floating captions run in the source tab. activeTab from the toolbar click,
+   *  the keyboard shortcut or the capture itself allows injecting them. */
+  async function injectOverlay(tabId: number) {
+    try {
+      await browser.scripting.executeScript({ target: { tabId }, files: ['/content-scripts/overlay.js'] });
+      return true;
+    } catch { return false; }
+  }
+
+  /** Show or hide the caption on the page now; a fresh page (after a reload) shows it. */
+  async function toggleOverlay(tabId?: number) {
+    source ??= (await browser.storage.session.get('source')).source as Source | undefined;
+    const target = tabId ?? source?.tabId;
+    if (target == null) return { ok: false };
+    try {
+      const [probe] = await browser.scripting.executeScript({ target: { tabId: target },
+        func: () => Boolean((window as typeof window & { __nimdayduOverlay?: unknown }).__nimdayduOverlay) });
+      const fresh = !probe?.result;
+      if (fresh && !await injectOverlay(target)) return { ok: false };
+      await browser.scripting.executeScript({ target: { tabId: target }, args: [fresh],
+        func: (show: boolean) => (window as typeof window & { __nimdayduOverlay?: (action: string) => void }).__nimdayduOverlay?.(show ? 'show' : 'toggle') });
+      return { ok: true };
+    } catch { return { ok: false }; }
+  }
+
+  browser.commands?.onCommand.addListener((command, tab) => {
+    if (command === 'toggle-overlay') void toggleOverlay(tab?.id);
   });
 
   async function ensureOffscreen() {
@@ -81,12 +115,15 @@ export default defineBackground(() => {
           if (['starting', 'capturing', 'paused', 'stopping'].includes(snapshot.state.phase)) throw new Error('已有字幕会话，请先停止。');
           const streamId = await browser.tabCapture.getMediaStreamId({ targetTabId: source.tabId });
           const settings = readSettings((await browser.storage.local.get('settings')).settings as Partial<Settings> | undefined);
-          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, viewId: message.viewId, canTranslate: message.canTranslate, sentenceHold: message.sentenceHold, autoSave: settings.autoSave });
+          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, viewId: message.viewId, canTranslate: message.canTranslate, sentenceHold: message.sentenceHold, autoSave: settings.autoSave, translationMode: settings.translationMode });
           if (result?.error) throw new Error(result.error);
           if (!result?.ok) throw new Error('采音页面没有确认启动，请重新打开侧栏后重试。');
+          // The page shows it according to the floating-caption setting.
+          if (settings.overlay !== 'off') void injectOverlay(source.tabId);
           return result;
         } finally { starting = false; }
       }
+      if (message.type === 'overlay') return toggleOverlay();
       if (message.type === 'badge') {
         await browser.action.setBadgeText({ text: message.phase === 'capturing' ? 'ON' : message.phase === 'paused' ? 'Ⅱ' : '' });
         await browser.action.setBadgeBackgroundColor({ color: '#d5d7dd' });

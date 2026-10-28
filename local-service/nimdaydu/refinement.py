@@ -1,5 +1,7 @@
 """Optional acoustic second pass. Audio stays in a bounded RAM window."""
 from collections import deque
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
@@ -10,9 +12,38 @@ import numpy as np
 from .config import ROOT
 from .engine import MoonshineEngine
 from .segmentation import weak, join_fragments
+from .system import SETUP_SCRIPT
 
-MODEL_DIR = ROOT / 'models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8'
+# Second-pass models from the sherpa-onnx releases: name -> (directory, archive SHA256).
+REFINERS = {
+    'parakeet-v3': ('sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8', '5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf'),
+    'parakeet-v2': ('sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8', '157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad'),
+}
+REFINER_CHOICE = ROOT / 'models/refiner.json'
 FINISH_TIMEOUT = 5.0
+# Unfinished lines wait for their continuation before the second pass. In
+# continuous conversation that chain can grow until it hits this bound, and the
+# whole span is finalized (and translated) only then. 15 s keeps meetings
+# readable; Moonshine's own forced splits come every ~10 s.
+MAX_MERGE_SECONDS = 15.0
+
+
+def selected_refiner():
+    # Installs from before v0.6 have Parakeet v3 and no choice file.
+    if REFINER_CHOICE.exists():
+        return json.loads(REFINER_CHOICE.read_text(encoding='utf-8'))['refiner']
+    return 'parakeet-v3'
+
+
+def drop_repeated_start(previous, current):
+    """Remove words a neighbouring overlapping region already recognized."""
+    left = list(re.finditer(r"\w+(?:['’-]\w+)*", previous))
+    right = list(re.finditer(r"\w+(?:['’-]\w+)*", current))
+    for size in range(min(6, len(left), len(right) - 1), 0, -1):
+        if [word.group().lower() for word in left[-size:]] == [word.group().lower() for word in right[:size]]:
+            rest = current[right[size - 1].end():].lstrip(' ,;:-')
+            return rest[:1].upper() + rest[1:]
+    return current
 
 
 def join_drafts(previous, current, overlap=False):
@@ -56,16 +87,22 @@ class AudioWindow:
         return np.concatenate(parts) if parts else None
 
 
-class ParakeetRefiner:
-    def __init__(self):
+class SherpaRefiner:
+    """Re-recognize one finished utterance with Parakeet TDT through sherpa-onnx."""
+    def __init__(self, name=None):
         import sherpa_onnx
-        required = ['encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt']
-        if not all((MODEL_DIR / filename).exists() for filename in required):
-            raise RuntimeError('Parakeet weights missing. Run download_refiner.py.')
+        self.name = name or selected_refiner()
+        directory = ROOT / 'models' / REFINERS[self.name][0]
+        if not (directory / 'tokens.txt').exists():
+            raise RuntimeError(f'{self.name} weights missing. Run {SETUP_SCRIPT} again.')
+        # A quarter of the cores, two to four: a 30 s utterance finishes in
+        # about a second while live drafts, the browser and the translator keep
+        # theirs (four on a 14-core Intel laptop, two on a 10-core M4).
+        threads = min(4, max(2, (os.cpu_count() or 8) // 4))
         self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=str(MODEL_DIR / required[0]), decoder=str(MODEL_DIR / required[1]),
-            joiner=str(MODEL_DIR / required[2]), tokens=str(MODEL_DIR / required[3]),
-            model_type='nemo_transducer', num_threads=4, provider='cpu')
+            encoder=str(directory / 'encoder.int8.onnx'), decoder=str(directory / 'decoder.int8.onnx'),
+            joiner=str(directory / 'joiner.int8.onnx'), tokens=str(directory / 'tokens.txt'),
+            model_type='nemo_transducer', num_threads=threads, provider='cpu')
 
     def transcribe(self, samples, rate):
         stream = self.recognizer.create_stream()
@@ -80,7 +117,7 @@ class RefinedEngine:
     The acoustic draft never becomes canonical until its second pass completes.
     Errors/overload retain the original acoustic result and report degradation.
     """
-    def __init__(self, model='hybrid', draft_factory=MoonshineEngine, refiner_factory=ParakeetRefiner):
+    def __init__(self, model='hybrid', draft_factory=MoonshineEngine, refiner_factory=SherpaRefiner):
         self.refiner = refiner_factory()
         self.draft = draft_factory('small')
         self.model = 'hybrid'
@@ -97,6 +134,7 @@ class RefinedEngine:
         self.held_live = False
         self.held_at = 0
         self.revisions = {}
+        self.last_final = None
         self.stats = {'completed': 0, 'fallbacks': 0, 'failures': 0, 'maxRefinementMs': 0, 'inferenceSeconds': 0.0}
 
     def begin(self, emit):
@@ -105,21 +143,30 @@ class RefinedEngine:
             self.pending.clear(); self.window.clear()
             self.emit = emit
             self.warning = False
-            self.held = None; self.held_live = False; self.revisions.clear()
+            self.held = None; self.held_live = False; self.revisions.clear(); self.last_final = None
             self.stats = {'completed': 0, 'fallbacks': 0, 'failures': 0, 'maxRefinementMs': 0, 'inferenceSeconds': 0.0}
         self.draft.begin(self._event)
 
-    def audio(self, packet, rate):
+    def audio(self, packet, rate, behind=False):
         self.window.append(packet, rate)
-        self.draft.audio(packet, rate)
+        self.draft.audio(packet, rate, behind)
         with self.lock:
             if self.held and not self.held_live and self.window.end / rate - self.held_at >= .8:
                 self._flush_held()
 
+    def _final(self, message, text):
+        # Regions only overlap when the merge bound split a continuous chain
+        # inside Moonshine's ~0.5 s overlap; both passes then hear those words.
+        previous = self.last_final
+        if previous and previous['start'] < message['start'] < previous['end']:
+            text = drop_repeated_start(previous['text'], text)
+        self.last_final = {'start': message['start'], 'end': message['end'], 'text': text}
+        return {**message, 'text': text, 'final': True, 'revision': message['revision'] + 1}
+
     def _fallback(self, message):
         self.stats['fallbacks'] += 1
         self.warning = True
-        self.emit({**message, 'final': True, 'revision': message['revision'] + 1})
+        self.emit(self._final(message, message['text']))
         self.emit({'type': 'warning', 'message': '整句复核暂未完成，当前使用实时识别结果。'})
 
     def _event(self, message):
@@ -137,7 +184,7 @@ class RefinedEngine:
             if self.held:
                 unfinished = weak(self.held['text']) or not re.search(r'[.!?]["”’]*$', self.held['text'])
                 close = message['start'] < self.held['end'] + .1 or (unfinished and message['start'] <= self.held['end'] + 1.5)
-                if close and message['end'] - self.held['start'] <= 30:
+                if close and message['end'] - self.held['start'] <= MAX_MERGE_SECONDS:
                     message = {**message, 'id': self.held['id'], 'start': self.held['start'],
                                'text': join_drafts(self.held['text'], message['text'], message['start'] < self.held['end'])}
                     self.held_live = not message['final']
@@ -212,7 +259,7 @@ class RefinedEngine:
                     self.stats['completed'] += 1
                     self.stats['maxRefinementMs'] = max(self.stats['maxRefinementMs'], round(elapsed * 1000))
                     self.stats['inferenceSeconds'] += elapsed
-                    callback({**message, 'text': text, 'final': True, 'revision': message['revision'] + 1})
+                    callback(self._final(message, text))
                     if self.warning:
                         self.warning = False
                         callback({'type': 'warning', 'message': ''})
@@ -248,7 +295,8 @@ class RefinedEngine:
 
     def metrics(self):
         with self.lock:
-            return {**self.stats, 'pending': len(self.pending), 'inferenceSeconds': round(self.stats['inferenceSeconds'], 3)}
+            return {**self.stats, 'pending': len(self.pending), 'inferenceSeconds': round(self.stats['inferenceSeconds'], 3),
+                    'refiner': getattr(self.refiner, 'name', None)}
 
     def close(self):
         self.finish(); self.draft.close()

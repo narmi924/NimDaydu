@@ -21,7 +21,7 @@ class FakeEngine:
         self.emit = emit
         self.epoch = 0
 
-    def audio(self, packet, rate):
+    def audio(self, packet, rate, behind=False):
         self.offset = packet.offset / rate
         if not self.active:
             self.active = True
@@ -41,7 +41,13 @@ class FakeEngine:
 
 
 class FakeTranslator:
-    def translate(self, text):
+    name = 'Fake-MT'
+
+    def __init__(self):
+        self.contexts = []
+
+    def translate(self, text, context=()):
+        self.contexts.append(list(context))
         return '你好，Discord。'
 
 
@@ -144,8 +150,10 @@ def test_deepseek_requires_key_and_never_automatically_falls_back(service):
     client, token = service
     assert client.post('/translate', json={'text': 'Hello'}).status_code == 401
     assert client.post('/translate', headers={'Authorization': f'Bearer {token}'}, json={'text': 'Hello'}).status_code == 503
-    result = client.post('/translate', headers={'Authorization': f'Bearer {token}'}, json={'text': 'Hello Discord', 'provider': 'offline'})
-    assert result.json() == {'text': '你好，Discord。', 'provider': 'offline'}
+    result = client.post('/translate', headers={'Authorization': f'Bearer {token}'},
+                         json={'text': 'Hello Discord', 'provider': 'offline', 'context': ['Earlier line.']})
+    assert result.json() == {'text': '你好，Discord。', 'provider': 'offline', 'engine': 'Fake-MT'}
+    assert client.get('/health').json()['translationEngine'] == 'Fake-MT'
 
 
 def test_auto_connect_only_exposes_token_to_fixed_extension_origin(service):
@@ -254,3 +262,33 @@ def test_optional_provider_key_is_local_and_not_returned_in_responses(service):
     assert response.json()['deepseekConfigured'] is True
     assert 'test-only-key' not in response.text
     assert client.post('/providers/deepseek', headers=headers, json={'clear': True}).json() == {'deepseekConfigured': False}
+
+
+def test_settled_captions_wait_for_the_model_while_live_drafts_give_way(tmp_path):
+    import threading, time
+    gate = threading.Event()
+    calls = []
+
+    class SlowTranslator(FakeTranslator):
+        def translate(self, text, context=()):
+            calls.append(text)
+            if text == 'First.':
+                gate.wait(2)
+            return text
+
+    app = create_app(FakeEngine, tmp_path, SlowTranslator)
+    token = json.loads((tmp_path / 'config.json').read_text())['token']
+    headers = {'Authorization': f'Bearer {token}'}
+    with TestClient(app, base_url='http://127.0.0.1') as client:
+        results = {}
+        def settled(text):
+            results[text] = client.post('/translate', headers=headers, json={'text': text, 'provider': 'offline'}).status_code
+        first = threading.Thread(target=settled, args=('First.',)); first.start()
+        time.sleep(.2)
+        second = threading.Thread(target=settled, args=('Second.',)); second.start()
+        time.sleep(.2)
+        draft = client.post('/translate', headers=headers, json={'text': 'Draft.', 'provider': 'offline', 'draft': True})
+        assert draft.status_code == 429
+        gate.set(); first.join(); second.join()
+        assert results == {'First.': 200, 'Second.': 200}
+        assert calls == ['First.', 'Second.']

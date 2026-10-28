@@ -21,15 +21,24 @@ from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import ROOT, load_settings
+from .system import PLATFORM, SETUP_SCRIPT, prefer_performance
 from .refinement import create_engine
 from .protocol import FrameOrder, Hello, parse_frame
-from .translation import OfflineTranslator
+from .translation import create_translator
 from .segmentation import SentenceAssembler
 from .outputs import OutputStore
 
 log = logging.getLogger("nimdaydu")
+VERSION = '0.7.0'
 AUDIO_STALL_TIMEOUT = 3.0
-AUDIO_RECOVERY_TIMEOUT = 8.0
+AUDIO_RECOVERY_TIMEOUT = 15.0
+# About one second of queued audio: the recognizer skips draft passes until it
+# has caught up, instead of falling further behind.
+BEHIND_FRAMES = 12
+# Six seconds of 80 ms frames. A draft pass over a long line can take three
+# seconds during overlapping speech; the queue absorbs it without stalling the
+# socket, and catch-up drains it right after.
+AUDIO_QUEUE_FRAMES = 75
 
 
 def allowed_origin(origin: str | None) -> bool:
@@ -41,6 +50,9 @@ class TranslationRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     context: list[str] = Field(default_factory=list, max_length=2)
     provider: Literal['offline', 'deepseek'] = 'deepseek'
+    # Speculative translation of live English: it only runs when the model is
+    # idle, so it never delays a settled caption.
+    draft: bool = False
 
 
 class ProviderSettings(BaseModel):
@@ -89,16 +101,18 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
     @asynccontextmanager
     async def lifespan(_app):
         nonlocal engine, engine_error, offline_translator
+        prefer_performance()
         try:
             engine = await native(engine_factory or create_engine, settings.model)
             log.info("Local ASR ready: %s (CPU)", settings.model)
         except Exception:
-            engine_error = "Model could not load. Run setup.ps1 or read .nimdaydu/service.err.log."
+            engine_error = f"Model could not load. Run {SETUP_SCRIPT} or read .nimdaydu/service.err.log."
             log.exception("ASR initialization failed")
         try:
-            offline_translator = await asyncio.get_running_loop().run_in_executor(translation_executor, translator_factory or OfflineTranslator)
+            offline_translator = await asyncio.get_running_loop().run_in_executor(translation_executor, translator_factory or create_translator)
+            log.info('Local translation ready: %s', getattr(offline_translator, 'name', 'offline'))
         except Exception:
-            log.warning('Offline translation model unavailable. Run download_translation.py.', exc_info=True)
+            log.warning('Offline translation model unavailable. Run %s.', SETUP_SCRIPT, exc_info=True)
         output_task = asyncio.create_task(outputs.run())
         try:
             yield
@@ -108,6 +122,8 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
             await outputs.flush()
             if engine:
                 await native(engine.close)
+            if offline_translator and hasattr(offline_translator, 'close'):
+                await asyncio.get_running_loop().run_in_executor(translation_executor, offline_translator.close)
             executor.shutdown(wait=True)
             translation_executor.shutdown(wait=True)
 
@@ -131,10 +147,11 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
 
     @app.get("/health")
     async def health():
-        return {"app": "NimDaydu", "version": "0.5.0", "ready": engine is not None and not loading,
+        return {"app": "NimDaydu", "version": VERSION, "ready": engine is not None and not loading,
                 "model": settings.model, "error": engine_error, "busy": busy, 'processId': os.getpid(),
                 'audio': capture_metrics, 'refinement': engine.metrics() if engine and hasattr(engine, 'metrics') else None,
-                'autoSaveFailed': outputs.failed}
+                'autoSaveFailed': outputs.failed, 'platform': PLATFORM,
+                'translationEngine': getattr(offline_translator, 'name', None)}
 
     def verify_extension(request):
         # Browser-controlled Origin, never an extensionId supplied in a body.
@@ -152,8 +169,9 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
         verify_extension(request)
         return JSONResponse({'token': settings.token, 'ready': engine is not None and not loading, 'model': settings.model,
                              'offlineTranslationReady': offline_translator is not None,
+                             'translationEngine': getattr(offline_translator, 'name', None), 'platform': PLATFORM,
                              'deepseekConfigured': bool(providers['deepseek_key']), 'deepseekModel': providers['deepseek_model'],
-                             'version': '0.5.0', 'error': engine_error, 'outputDirectory': str(outputs.directory)},
+                             'version': VERSION, 'error': engine_error, 'outputDirectory': str(outputs.directory)},
                             headers={'Access-Control-Allow-Origin': extension_origin})
 
     @app.get("/capabilities")
@@ -230,7 +248,7 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
             if candidate:
                 await native(candidate.close)
             log.exception('ASR change failed')
-            raise HTTPException(status_code=503, detail='ASR model unavailable; run setup.ps1') from None
+            raise HTTPException(status_code=503, detail=f'ASR model unavailable; run {SETUP_SCRIPT}') from None
         finally:
             loading = False
 
@@ -241,7 +259,7 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
 h1{{color:#b9e7c7}}code{{display:block;background:#202a24;padding:22px;border-radius:12px;word-break:break-all;user-select:all}}
 a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音服务已启动。NimDaydu 扩展会自动连接，无需填写配对码。</p>
 <p>在声音所在标签页点击插件图标，再点击“开始”。</p>
-<p>模型：{html.escape(settings.model)} · 状态：{'就绪' if engine else '模型尚未就绪，请运行 setup.ps1'}</p>
+<p>模型：{html.escape(settings.model)} · 状态：{'就绪' if engine else f'模型尚未就绪，请运行 {SETUP_SCRIPT}'}</p>
 <p><a href="/health">查看服务状态</a></p></html>"""
 
     @app.post("/translate")
@@ -250,15 +268,24 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
         authorize(authorization)
         if body.provider == 'offline':
             if not offline_translator:
-                raise HTTPException(status_code=503, detail='Offline translation model missing. Run setup.ps1.')
-            if translate_lock.locked():
+                raise HTTPException(status_code=503, detail=f'Offline translation model missing. Run {SETUP_SCRIPT}.')
+            if body.draft and translate_lock.locked():
                 raise HTTPException(status_code=429, detail='Translation busy')
-            async with translate_lock:
-                try:
-                    translated = await asyncio.get_running_loop().run_in_executor(translation_executor, offline_translator.translate, body.text)
-                    return {'text': translated, 'provider': 'offline'}
-                except ValueError:
-                    raise HTTPException(status_code=413, detail='Caption too long for the local model') from None
+            try:
+                # Settled captions queue behind at most one running request.
+                await asyncio.wait_for(translate_lock.acquire(), timeout=8)
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=429, detail='Translation busy') from None
+            try:
+                translated = await asyncio.get_running_loop().run_in_executor(translation_executor, offline_translator.translate, body.text, body.context)
+                return {'text': translated, 'provider': 'offline', 'engine': getattr(offline_translator, 'name', None)}
+            except ValueError:
+                raise HTTPException(status_code=413, detail='Caption too long for the local model') from None
+            except Exception:
+                log.warning('Local translation failed', exc_info=True)
+                raise HTTPException(status_code=502, detail='Local translation failed') from None
+            finally:
+                translate_lock.release()
         if not providers['deepseek_key']:
             raise HTTPException(status_code=503, detail="DeepSeek key not configured; use offline translation.")
         if sum(len(text) for text in body.context) > 4000:
@@ -290,7 +317,7 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
         sender_task = worker_task = None
         session_id = str(uuid.uuid4())
         outgoing = asyncio.Queue(maxsize=100)
-        incoming = asyncio.Queue(maxsize=25)
+        incoming = asyncio.Queue(maxsize=AUDIO_QUEUE_FRAMES)
         loop = asyncio.get_running_loop()
         metrics = {'framesReceived': 0, 'framesProcessed': 0, 'maxQueuedFrames': 0,
                    'backpressureEvents': 0, 'maxInferenceMs': 0, 'inferenceSeconds': 0,
@@ -341,7 +368,7 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
                 try:
                     if kind == "audio":
                         before = time.perf_counter()
-                        await native(engine.audio, payload, rate)
+                        await native(engine.audio, payload, rate, incoming.qsize() >= BEHIND_FRAMES)
                         elapsed = time.perf_counter() - before
                         metrics['framesProcessed'] += 1
                         metrics['maxInferenceMs'] = max(metrics['maxInferenceMs'], round(elapsed * 1000))

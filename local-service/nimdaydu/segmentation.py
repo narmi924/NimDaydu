@@ -12,6 +12,12 @@ HOLD_SECONDS = 0.8
 PREFIXES = {'next', 'so', 'and', 'but', 'however', 'well', 'then', 'for example', 'i think', 'let me', 'because', 'although'}
 STANDALONE = {'yes', 'no', 'okay', 'ok', 'thanks', 'thank you', 'sure', 'right', 'agreed', 'exactly', 'hello', 'goodbye'}
 MONTHS = r'(?:january|february|march|april|may|june|july|august|september|october|november|december)'
+# Subtitle-sized units: about two short lines. Longer sentences are cut at
+# clause boundaries so each part is translated and shown as soon as possible.
+MAX_UNIT_WORDS = 16
+UNIT_TARGET_WORDS = 8
+MIN_UNIT_WORDS = 5
+CLAUSE_BOUNDARY = re.compile(r'(?<=[,;:])\s+|\s+(?=(?:and|but|so|because|which|when|while|if|then|or|although|though|whereas)\b)', re.I)
 
 
 def clean(text):
@@ -46,6 +52,30 @@ def split_sentences(text):
         start = boundary.end()
     result.append(text[start:])
     return result
+
+
+def split_units(text):
+    """Cut a long sentence at clause boundaries, never inside a clause.
+
+    Greedy from the left, so applying the same rule to a sentence that is
+    still being spoken gives the same cuts: rows already shown stay put while
+    words arrive, and the settled caption lands where its draft was.
+    """
+    if len(words(text)) <= MAX_UNIT_WORDS:
+        return [text]
+    pieces, start = [], 0
+    for boundary in CLAUSE_BOUNDARY.finditer(text):
+        left, rest = text[start:boundary.start()], text[boundary.end():]
+        if len(words(left)) >= UNIT_TARGET_WORDS and len(words(rest)) >= MIN_UNIT_WORDS:
+            pieces.append(left)
+            start = boundary.end()
+    pieces.append(text[start:])
+    return pieces
+
+
+def display_units(text):
+    """Sentences, then clause units: the rows a caption occupies on screen."""
+    return [unit for sentence in split_sentences(text) if sentence.strip() for unit in split_units(sentence.strip())]
 
 
 def continuation(previous, current):
@@ -92,7 +122,10 @@ class SentenceAssembler:
         if value != self.last_preview:
             self.preview_revision += 1
             self.last_preview = value
-        return {'revision': self.preview_revision, 'text': value[0], 'start': value[1], 'end': value[2]}
+        # Already cut like settled captions, so the live rows do not reflow
+        # from one long paragraph into sentences when the final arrives.
+        return {'revision': self.preview_revision, 'text': value[0], 'units': display_units(value[0]),
+                'start': value[1], 'end': value[2]}
 
     def _publish_preview(self):
         previous_revision = self.preview_revision
@@ -198,17 +231,30 @@ class SentenceAssembler:
         if gap > 1.8 or topic or self.paragraph_size >= 3:
             self.paragraph += 1
             self.paragraph_size = 0
-        self.counter += 1
         self.paragraph_size += 1
         self.last_end = last['end']
         for line in group:
             self.lines.pop(line['id'], None)
             self.committed.add(line['id'])
-        self.emit({'type': 'caption', 'id': f'sentence:{self.counter}', 'revision': 1, 'final': True,
-                   'text': text, 'start': first['start'], 'end': last['end'], 'paragraph': self.paragraph,
-                   'incomplete': incomplete, 'rawText': [line['text'] for line in group],
-                   'inferenceMs': max(line.get('inferenceMs', 0) for line in group),
-                   'preview': self._preview_snapshot()})
+        units = split_units(text)
+        total = sum(len(unit) for unit in units)
+        duration = max(0, last['end'] - first['start'])
+        offset = 0
+        for index, unit in enumerate(units):
+            final_unit = index == len(units) - 1
+            self.counter += 1
+            message = {'type': 'caption', 'id': f'sentence:{self.counter}', 'revision': 1, 'final': True,
+                       'text': unit, 'paragraph': self.paragraph,
+                       # Times inside one acoustic span are estimated by text length.
+                       'start': first['start'] + duration * offset / total,
+                       'end': last['end'] if final_unit else first['start'] + duration * (offset + len(unit)) / total,
+                       'incomplete': incomplete and final_unit, 'continued': not final_unit,
+                       'rawText': [line['text'] for line in group] if index == 0 else [],
+                       'inferenceMs': max(line.get('inferenceMs', 0) for line in group)}
+            offset += len(unit)
+            if final_unit:
+                message['preview'] = self._preview_snapshot()
+            self.emit(message)
         self._pending()
 
     def flush(self):

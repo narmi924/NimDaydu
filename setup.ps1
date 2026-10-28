@@ -17,6 +17,8 @@ try {
     }
     & '.\.venv\Scripts\python.exe' download_translation.py
     if ($LASTEXITCODE -ne 0) { throw 'Offline translation model download failed.' }
+    & '.\.venv\Scripts\python.exe' download_llm.py
+    if ($LASTEXITCODE -ne 0) { throw 'Local translation model download failed. Re-run setup.ps1 to resume.' }
 } finally { Pop-Location }
 Push-Location (Join-Path $projectDir 'extension')
 try {

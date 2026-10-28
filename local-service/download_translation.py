@@ -46,7 +46,7 @@ def main():
     metadata = json.loads(metadata_file.read_text(encoding='utf-8'))
     if metadata['from_code'] != 'en' or metadata['to_code'] != 'zh':
         raise RuntimeError('Unexpected translation language pair')
-    (directory / 'manifest.json').write_text(json.dumps({'path': str(metadata_file.parent.relative_to(ROOT)), 'url': URL, 'sha256': digest}, indent=2), encoding='utf-8')
+    (directory / 'manifest.json').write_text(json.dumps({'path': metadata_file.parent.relative_to(ROOT).as_posix(), 'url': URL, 'sha256': digest}, indent=2), encoding='utf-8')
     print(f'Offline English-to-Chinese ready. SHA256: {digest}', flush=True)
 
 

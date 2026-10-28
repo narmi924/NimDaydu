@@ -8,6 +8,12 @@ it('enables saving for existing settings while preserving an explicit opt-out', 
   expect(readSettings({ schema: 2, autoSave: false }).autoSave).toBe(false);
 });
 
+it('moves the old default translation wait to the faster one but keeps a deliberate choice', () => {
+  expect(readSettings({ schema: 2, sentenceHold: 0.8 })).toMatchObject({ schema: 3, sentenceHold: 0.4, overlay: 'fullscreen' });
+  expect(readSettings({ schema: 2, sentenceHold: 1.2 }).sentenceHold).toBe(1.2);
+  expect(readSettings({ schema: 3, sentenceHold: 0.8 }).sentenceHold).toBe(0.8);
+});
+
 describe('live caption revisions', () => {
   it('replaces a partial rather than adding duplicates and rejects stale ASR updates', () => {
     const updated = mergeCaption([base], { ...base, revision: 3, text: 'Open the application form.', final: true });

@@ -9,6 +9,7 @@ __pycache__/
 .env.*
 !.env.example
 .nimdaydu/
+.tools/
 models/
 samples/*.wav
 samples/*.mp3
@@ -16,3 +17,9 @@ artifacts/
 OUTPUTS/
 *.log
 
+
+# figure builds: the README copies live in docs/images
+docs/dev/figures/*/*.look/
+docs/dev/figures/*/*.png
+docs/dev/figures/*/*.svg
+docs/dev/figures/*/*.layout.json

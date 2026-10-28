@@ -64,7 +64,7 @@ class OutputStore:
             return
         # The assembler's internal preview must not be saved with the final.
         saved = {key: caption[key] for key in ['id', 'revision', 'final', 'text', 'start', 'end',
-                 'paragraph', 'incomplete', 'rawText'] if key in caption}
+                 'paragraph', 'incomplete', 'continued', 'rawText'] if key in caption}
         session['captions'].setdefault(saved['id'], saved)
         session['dirty'] = True
 

@@ -1,7 +1,11 @@
 import { browser } from 'wxt/browser';
 import { diagnosticSnapshot, recordDiagnostic } from '../../lib/diagnostics';
-import { applyTranslation, DEFAULT_SETTINGS, isActive, mergeCaption, mergePreview, SOCKET, type Caption, type CaptureState, type EnglishPreview, type Source } from '../../lib/types';
+import { applyTranslation, DEFAULT_SETTINGS, draftKey, isActive, mergeCaption, mergePreview, SOCKET, type Caption, type CaptureState, type DraftTranslations, type EnglishPreview, type Source, type TranslationMode } from '../../lib/types';
+import { previewUnits } from '../../lib/reader';
 import { OutputSync } from '../../lib/output-sync';
+import { finalTranslation, serviceTranslate, TranslationQueue, type TranslationStatus } from '../../lib/translation';
+import { START_SCRIPT } from '../../lib/platform';
+import { OVERLAY_HISTORY } from '../../lib/overlay';
 
 let state: CaptureState = { phase: 'idle' };
 let captions: Caption[] = [];
@@ -33,8 +37,93 @@ const outputs = new OutputSync(failed => { translationSaveFailed = failed; savin
 // Only chrome.runtime is available in an offscreen document. Settings are
 // read/watched by the service worker and delivered through runtime messages.
 
+// The local model and DeepSeek are translated here, so captions keep their
+// Chinese while the side panel is hidden (fullscreen) or closed. Chrome's own
+// translator only exists in a visible page; that mode stays with the side panel.
+let translationMode: TranslationMode | undefined;
+let serviceToken = '';
+let translationStatus: TranslationStatus = { pending: 0, failed: 0, retrying: 0, running: false };
+const servesTranslation = () => translationMode === 'offline' || translationMode === 'deepseek';
+const serviceQueue = new TranslationQueue(
+  (caption, signal) => {
+    // A live draft of the same words was already translated: no second model call.
+    const drafted = draftModel.get(draftKey(caption.text));
+    if (drafted !== undefined) return Promise.resolve(drafted);
+    return serviceTranslate(caption.text, serviceToken,
+      captions.filter(c => c.final && c.start < caption.start).slice(-2).map(c => c.text), translationMode as 'offline' | 'deepseek', signal);
+  },
+  (caption, text) => acceptTranslation({ sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text }),
+  () => {}, { onChange: status => {
+    translationStatus = status; publish({ type: 'translationStatus', status });
+    if (!status.pending && !status.running) void pumpDrafts();
+  } });
+
+// Live English rows that are already complete (every row but the one still
+// being spoken, unless it already ends a sentence) are translated while the
+// local model is idle. Chinese then
+// appears as the sentence ends instead of after the second pass, and the
+// settled caption reuses it when the words agree. Paid DeepSeek is not used.
+const draftModel = new Map<string, string>();
+let drafts: DraftTranslations = {};
+let drafting = false;
+async function pumpDrafts() {
+  if (drafting || translationMode !== 'offline' || state.phase !== 'capturing') return;
+  if (translationStatus.pending || translationStatus.running) return;
+  // The last row is usually still being spoken; once the recognizer closes it
+  // with sentence punctuation it is very likely finished too.
+  const units = previewUnits(preview);
+  const ready = /[.!?]["”’]*$/.test(units.at(-1) ?? '') ? units : units.slice(0, -1);
+  const unit = ready.find(text => !draftModel.has(draftKey(text)));
+  if (!unit) return;
+  drafting = true;
+  const session = state.sessionId;
+  let done = false;
+  try {
+    const text = await serviceTranslate(unit, serviceToken, [], 'offline', AbortSignal.timeout(8000), true);
+    if (session !== state.sessionId) return;
+    const key = draftKey(unit);
+    draftModel.set(key, text);
+    drafts = { ...drafts, [key]: finalTranslation(text, false, !/[.!?]["”’]*$/.test(unit)) };
+    if (draftModel.size > 300) {
+      const oldest = draftModel.keys().next().value!;
+      draftModel.delete(oldest);
+      const { [oldest]: _removed, ...rest } = drafts;
+      drafts = rest;
+    }
+    publish({ type: 'draft', sessionId: session, key, text: drafts[key] });
+    done = true;
+  } catch { /* Busy or failed: the settled caption is translated normally. */ }
+  finally {
+    drafting = false;
+    if (done) void pumpDrafts();
+  }
+}
+function resetDrafts() { draftModel.clear(); drafts = {}; }
+
+// Floating captions on the source page connect here and count as an open view.
+const overlays = new Set<ReturnType<typeof browser.runtime.connect>>();
+const OVERLAY_TYPES = new Set(['state', 'caption', 'preview', 'translation', 'draft', 'cleared']);
+
 function publish(message: Record<string, unknown>) {
   void browser.runtime.sendMessage({ target: 'ui', ...message }).catch(() => {});
+  if (!OVERLAY_TYPES.has(message.type as string)) return;
+  for (const port of overlays) { try { port.postMessage(message); } catch { overlays.delete(port); } }
+}
+
+function acceptTranslation(message: { sessionId: string; id: string; revision: number; text: string }) {
+  captions = applyTranslation(captions, message);
+  const translated = captions.find(caption => caption.sessionId === message.sessionId && caption.id === message.id);
+  if (translated) outputs.enqueue(translated);
+  publish({ type: 'translation', ...message });
+}
+
+function setTranslationMode(mode: TranslationMode | undefined) {
+  if (mode === translationMode) return;
+  serviceQueue.reset();
+  resetDrafts();
+  translationMode = mode;
+  translationOwner = undefined;
+  if (servesTranslation()) captions.forEach(caption => serviceQueue.enqueue(caption));
 }
 function setState(update: Partial<CaptureState>) {
   state = { ...state, ...update };
@@ -73,7 +162,7 @@ async function stop(message?: string, failed = false) {
   return stopping;
 }
 
-async function start(source: Source, streamId: string, token: string, viewId: string, canTranslate: boolean, sentenceHold: number, autoSave: boolean) {
+async function start(source: Source, streamId: string, token: string, viewId: string, canTranslate: boolean, sentenceHold: number, autoSave: boolean, mode?: TranslationMode) {
   if (isActive(state.phase)) throw new Error('已有会话运行中。');
   await cleanup();
   captions = [];
@@ -81,7 +170,11 @@ async function start(source: Source, streamId: string, token: string, viewId: st
   sequence = 0;
   lastLease = Date.now();
   viewLeases.set(viewId, lastLease);
-  translationOwner = canTranslate ? viewId : undefined;
+  serviceQueue.reset();
+  resetDrafts();
+  translationMode = mode;
+  serviceToken = token;
+  translationOwner = canTranslate && !servesTranslation() ? viewId : undefined;
   state = { phase: 'starting', source, startedAt: Date.now() };
   setState({});
   try {
@@ -102,7 +195,7 @@ async function start(source: Source, streamId: string, token: string, viewId: st
     socket = new WebSocket(SOCKET);
     const currentSocket = socket;
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error('本机服务连接超时，请运行 start.ps1。')), 8000);
+      const timeout = setTimeout(() => reject(new Error(`本机服务连接超时，请运行 ${START_SCRIPT}。`)), 8000);
       currentSocket.onopen = () => currentSocket.send(JSON.stringify({ type: 'hello', protocol: 1, token, sampleRate: rate, format: 'f32le', channels: 1, sentenceHold,
         autoSave, source: { title: source.title.slice(0, 500), site: source.site || '网页', host: source.host || '' } }));
       currentSocket.onmessage = event => {
@@ -121,9 +214,12 @@ async function start(source: Source, streamId: string, token: string, viewId: st
           if (remainingPreview) preview = mergePreview(preview, { ...remainingPreview, sessionId: message.sessionId }, state.sessionId);
           // Replace the preview and add its settled sentence atomically.
           publish({ type: 'caption', caption, preview });
+          if (servesTranslation()) serviceQueue.enqueue(caption as Caption);
+          void pumpDrafts();
         } else if (message.type === 'preview' && message.sessionId === state.sessionId) {
           preview = mergePreview(preview, message as EnglishPreview, state.sessionId);
           publish({ type: 'preview', preview });
+          void pumpDrafts();
         } else if (message.type === 'pending' && message.sessionId === state.sessionId && message.pending !== state.pending) {
           setState({ pending: message.pending });
         } else if (message.type === 'backpressure' && message.sessionId === state.sessionId) {
@@ -143,7 +239,7 @@ async function start(source: Source, streamId: string, token: string, viewId: st
       currentSocket.onerror = () => {
         recordDiagnostic('connection', 'socket_error');
         clearTimeout(timeout);
-        reject(new Error('无法连接本机语音服务。请先运行 start.ps1。'));
+        reject(new Error(`无法连接本机语音服务。请先运行 ${START_SCRIPT}。`));
       };
       currentSocket.onclose = event => {
         recordDiagnostic('capture', 'socket_closed', { closeCode: event.code });
@@ -187,11 +283,14 @@ async function start(source: Source, streamId: string, token: string, viewId: st
 browser.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.target !== 'offscreen' || sender.id !== browser.runtime.id) return;
   (async () => {
-    if (message.type === 'snapshot') return { state, captions, preview };
+    if (message.type === 'snapshot') return { state, captions, preview, drafts, translationStatus, serviceTranslation: servesTranslation() };
     if (message.type === 'diagnostics') return { phase: state.phase, recovering: Boolean(state.recovering), events: diagnosticSnapshot() };
     if (message.type === 'settings') {
-      outputs.configure(message.autoSave === true);
-      if (message.autoSave === true) captions.forEach(caption => outputs.enqueue(caption));
+      if ('autoSave' in message) {
+        outputs.configure(message.autoSave === true);
+        if (message.autoSave === true) captions.forEach(caption => outputs.enqueue(caption));
+      }
+      if ('translationMode' in message) setTranslationMode(message.translationMode);
       return { ok: true };
     }
     if (message.type === 'lease') {
@@ -199,11 +298,11 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       viewLeases.set(message.viewId, lastLease);
       for (const [id, timestamp] of viewLeases) if (lastLease - timestamp > 10000) viewLeases.delete(id);
       if (translationOwner && !viewLeases.has(translationOwner)) translationOwner = undefined;
-      if (message.canTranslate && !translationOwner) translationOwner = message.viewId;
+      if (message.canTranslate && !translationOwner && !servesTranslation()) translationOwner = message.viewId;
       if (!message.canTranslate && translationOwner === message.viewId) translationOwner = undefined;
       return { owner: translationOwner === message.viewId };
     }
-    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.viewId, message.canTranslate, message.sentenceHold || 0.8, message.autoSave ?? DEFAULT_SETTINGS.autoSave);
+    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.viewId, message.canTranslate, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode);
     if (message.type === 'pause' && state.phase === 'capturing') {
       setState({ phase: 'paused' });
       socket?.send(JSON.stringify({ type: 'pause' }));
@@ -213,14 +312,16 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
     } else if (message.type === 'stop') await stop();
     else if (message.type === 'sourceClosed' && message.tabId === state.source?.tabId && isActive(state.phase)) await stop('来源标签页已关闭。');
     else if (message.type === 'translation') {
-      if (message.viewId !== translationOwner) return { ok: false };
-      captions = applyTranslation(captions, message);
-      const translated = captions.find(caption => caption.sessionId === message.sessionId && caption.id === message.id);
-      if (translated) outputs.enqueue(translated);
-      publish({ ...message, target: 'ui' });
+      if (servesTranslation() || message.viewId !== translationOwner) return { ok: false };
+      acceptTranslation({ sessionId: message.sessionId, id: message.id, revision: message.revision, text: message.text });
+    } else if (message.type === 'retryTranslation' && servesTranslation()) {
+      serviceQueue.retryFailed();
+      captions.forEach(caption => serviceQueue.enqueue(caption));
     } else if (message.type === 'clear' && !isActive(state.phase)) {
       captions = [];
       preview = undefined;
+      serviceQueue.reset();
+      resetDrafts();
       publish({ type: 'cleared' });
     }
     return { ok: true };
@@ -228,8 +329,17 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
   return true;
 });
 
+browser.runtime.onConnect.addListener(port => {
+  if (port.name !== 'nimdaydu-overlay' || port.sender?.id !== browser.runtime.id) return;
+  overlays.add(port);
+  port.onDisconnect.addListener(() => overlays.delete(port));
+  port.postMessage({ type: 'snapshot', state, captions: captions.slice(-OVERLAY_HISTORY), preview, drafts });
+});
+
 setInterval(() => {
+  // Floating captions are a view too: the side panel may close during a meeting.
+  if (overlays.size) lastLease = Date.now();
   if (isActive(state.phase) && state.phase !== 'stopping' && Date.now() - lastLease > 10000) {
-    recordDiagnostic('capture', 'view_lease_expired'); void stop('侧栏已关闭，采集自动停止。');
+    recordDiagnostic('capture', 'view_lease_expired'); void stop('侧栏和悬浮字幕都已关闭，采集自动停止。');
   }
 }, 2000);

@@ -1,5 +1,6 @@
 import { SERVICE, type Caption } from './types';
 import { errorName, recordDiagnostic } from './diagnostics';
+import { SETUP_SCRIPT } from './platform';
 
 type TranslatorInstance = { translate(text: string, options?: { signal: AbortSignal }): Promise<string>; destroy(): void };
 
@@ -16,12 +17,15 @@ function bounded<T>(work: (signal: AbortSignal) => Promise<T>, timeoutMs: number
     try { Promise.resolve(work(controller.signal)).then(resolve, reject); } catch (error) { reject(error); }
   }).finally(() => { clearTimeout(timer); external?.removeEventListener('abort', cancel); });
 }
-export function finalTranslation(text: string, incomplete = false): string {
+export function finalTranslation(text: string, incomplete = false, continued = false): string {
   const cleaned = text.trim().replace(/,\s*(?=\p{Script=Han})|(?<=\p{Script=Han}),\s*/gu, '，');
   if (!cleaned) throw new Error('翻译返回了空结果，英文字幕已保留。');
   if (incomplete) return cleaned.replace(/[。.!?！？…]+$/, '') + '…';
+  // A clause of a longer sentence reads on into the next caption.
+  if (continued && !/[?？]["”’」]*$/.test(cleaned)) return cleaned.replace(/[。.,，!！;；…]+$/, '') + '，';
   if (cleaned.endsWith('.')) return cleaned.slice(0, -1) + '。';
-  return /[。！？!?…][”’"」]*$/.test(cleaned) ? cleaned : cleaned + '。';
+  // Closing quotes may come out as opening ones (“…。“); either way the sentence has ended.
+  return /[。！？!?…][”’“‘"」]*$/.test(cleaned) ? cleaned : cleaned + '。';
 }
 type TranslatorFactory = {
   availability(options: { sourceLanguage: string; targetLanguage: string }): Promise<string>;
@@ -89,12 +93,12 @@ export class LocalTranslator {
   }
 }
 
-export async function serviceTranslate(text: string, token: string, context: string[], provider: 'offline' | 'deepseek', signal?: AbortSignal): Promise<string> {
+export async function serviceTranslate(text: string, token: string, context: string[], provider: 'offline' | 'deepseek', signal?: AbortSignal, draft = false): Promise<string> {
   const response = await fetch(`${SERVICE}/translate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ text, context, provider }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(22000)]) : AbortSignal.timeout(22000),
+    body: JSON.stringify(draft ? { text, context, provider, draft } : { text, context, provider }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(22000)]) : AbortSignal.timeout(22000),
   });
-  if (!response.ok) throw new Error(provider === 'offline' ? '本机离线翻译未就绪或正忙，请运行 setup.ps1 并重启服务。' : response.status === 503 ? '尚未配置 DeepSeek 密钥，请在项目 .env 中填写后重启服务。' : 'DeepSeek 翻译失败，请检查服务、密钥及网络。');
+  if (!response.ok) throw new Error(provider === 'offline' ? (response.status === 503 ? `本机翻译模型未就绪，请运行 ${SETUP_SCRIPT} 并重启服务。` : '本机翻译暂时失败，稍后自动重试。') : response.status === 503 ? '尚未配置 DeepSeek 密钥，请在设置中填写。' : 'DeepSeek 翻译失败，请检查服务、密钥及网络。');
   const result = await response.json();
   return result.text;
 }
@@ -163,7 +167,7 @@ export class TranslationQueue {
     try {
       if (job.result === undefined) {
         const text = await bounded(signal => this.translate(caption, signal), this.options.timeoutMs ?? 25000, active.controller.signal);
-        job.result = finalTranslation(text, caption.incomplete);
+        job.result = finalTranslation(text, caption.incomplete, caption.continued);
       }
       if (generation === this.generation) {
         await bounded(() => Promise.resolve(this.deliver(caption, job.result!)), 3000, active.controller.signal);

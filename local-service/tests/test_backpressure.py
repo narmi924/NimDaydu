@@ -16,14 +16,17 @@ class RealtimeEngine(FakeEngine):
     def __init__(self, model):
         super().__init__(model)
         self.processed = []
+        self.behind = []
 
-    def audio(self, packet, rate):
+    def audio(self, packet, rate, behind=False):
         # 20 ms of computation per 80 ms of audio can comfortably keep up.
         time.sleep(.02)
         self.processed.append(packet.sequence)
+        self.behind.append(behind)
 
 
-def test_delayed_audio_burst_is_processed_without_disconnect_or_lost_frames(tmp_path):
+def test_delayed_audio_burst_is_processed_without_disconnect_or_lost_frames(tmp_path, monkeypatch):
+    monkeypatch.setattr(importlib.import_module('nimdaydu.app'), 'AUDIO_QUEUE_FRAMES', 25)
     engine = RealtimeEngine('small')
     app = create_app(lambda _: engine, tmp_path, FakeTranslator)
     token = json.loads((tmp_path / 'config.json').read_text())['token']
@@ -49,6 +52,8 @@ def test_delayed_audio_burst_is_processed_without_disconnect_or_lost_frames(tmp_
                 ws.receive_json()
             assert closed.value.code == 1000
         assert engine.processed == list(range(48))
+        # A deep queue tells the recognizer to skip draft passes until it catches up.
+        assert any(engine.behind) and not engine.behind[-1]
         health = client.get('/health').json()
         assert health['busy'] is False
         assert recovery_states == [True, False]
@@ -61,11 +66,12 @@ def test_delayed_audio_burst_is_processed_without_disconnect_or_lost_frames(tmp_
 def test_persistent_overload_stops_with_a_clear_error_and_releases_the_session(
         tmp_path, monkeypatch, latency, stall_limit, recovery_limit):
     class StalledEngine(RealtimeEngine):
-        def audio(self, packet, rate):
+        def audio(self, packet, rate, behind=False):
             time.sleep(latency)
             self.processed.append(packet.sequence)
 
     app_module = importlib.import_module('nimdaydu.app')
+    monkeypatch.setattr(app_module, 'AUDIO_QUEUE_FRAMES', 25)
     monkeypatch.setattr(app_module, 'AUDIO_STALL_TIMEOUT', stall_limit)
     monkeypatch.setattr(app_module, 'AUDIO_RECOVERY_TIMEOUT', recovery_limit)
     app = create_app(StalledEngine, tmp_path, FakeTranslator)

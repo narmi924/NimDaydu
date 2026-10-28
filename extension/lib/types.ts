@@ -8,6 +8,8 @@ export type Caption = {
   start: number; end: number; inferenceMs?: number;
   translation?: string; translationRevision?: number;
   paragraph?: number; incomplete?: boolean; rawText?: string[];
+  /** A clause of a longer sentence; the sentence continues in the next caption. */
+  continued?: boolean;
 };
 export type Phase = 'idle' | 'starting' | 'capturing' | 'paused' | 'stopping' | 'stopped' | 'error';
 export type CaptureState = {
@@ -17,12 +19,19 @@ export type CaptureState = {
   recovering?: boolean;
   saveError?: string;
 };
-export type EnglishPreview = { sessionId: string; revision: number; text: string; start: number; end: number };
+/** Live English, already cut into the rows its settled captions will take (`units`). */
+export type EnglishPreview = { sessionId: string; revision: number; text: string; start: number; end: number; units?: string[] };
 export type Snapshot = { state: CaptureState; captions: Caption[]; preview?: EnglishPreview };
-export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number; autoSave: boolean };
-export const DEFAULT_SETTINGS: Settings = { schema: 2, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.8, autoSave: true };
+/** Floating captions on the page: only while it is fullscreen, always, or never. */
+export type OverlayMode = 'fullscreen' | 'always' | 'off';
+export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number; autoSave: boolean; overlay: OverlayMode };
+export const DEFAULT_SETTINGS: Settings = { schema: 3, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.4, autoSave: true, overlay: 'fullscreen' };
 export function readSettings(saved?: Partial<Settings>): Settings {
-  return saved?.schema === 2 ? { ...DEFAULT_SETTINGS, ...saved } : { ...DEFAULT_SETTINGS, token: saved?.token || '' };
+  if (saved?.schema === 3) return { ...DEFAULT_SETTINGS, ...saved };
+  // v0.5 users never chose 0.8 s; it was the old default. Shorter waits now
+  // pair with clause-sized captions, so move them to the new default.
+  if (saved?.schema === 2) return { ...DEFAULT_SETTINGS, ...saved, schema: 3, sentenceHold: saved.sentenceHold === 0.8 || saved.sentenceHold === undefined ? DEFAULT_SETTINGS.sentenceHold : saved.sentenceHold };
+  return { ...DEFAULT_SETTINGS, token: saved?.token || '' };
 }
 export const isActive = (phase: Phase) => ['starting', 'capturing', 'paused', 'stopping'].includes(phase);
 
@@ -49,6 +58,14 @@ export function applyTranslation(captions: Caption[], message: { sessionId: stri
   updated[index] = { ...captions[index]!, translation: message.text, translationRevision: message.revision };
   return updated;
 }
+
+/** Live and settled English often differ only in case or punctuation. */
+export function draftKey(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}']+/gu, ' ').trim();
+}
+
+/** Chinese for live English rows, keyed by draftKey; shown dimmed until the caption settles. */
+export type DraftTranslations = Record<string, string>;
 
 export function timestamp(seconds: number): string {
   const total = Math.max(0, Math.floor(seconds));

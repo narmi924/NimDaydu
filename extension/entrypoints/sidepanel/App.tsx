@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { browser } from 'wxt/browser';
-import { applyTranslation, isActive, mergeCaption, mergePreview, readSettings, DEFAULT_SETTINGS, timestamp,
-  type Caption, type CaptureState, type EnglishPreview, type Settings, type Source } from '../../lib/types';
-import { serviceTranslate, LocalTranslator, TranslationQueue, type TranslationStatus } from '../../lib/translation';
+import { applyTranslation, draftKey, isActive, mergeCaption, mergePreview, readSettings, DEFAULT_SETTINGS, timestamp,
+  type Caption, type CaptureState, type DraftTranslations, type EnglishPreview, type Settings, type Source } from '../../lib/types';
+import { LocalTranslator, TranslationQueue, type TranslationStatus } from '../../lib/translation';
 import { connectLocal, type Connection } from '../../lib/connection';
-import { readableCaptions, groupParagraphs } from '../../lib/reader';
-import { EnglishPreviewRow, ParagraphRow } from '../../lib/CaptionReader';
+import { IS_MAC, SETUP_SCRIPT } from '../../lib/platform';
+import { readableCaptions, groupParagraphs, previewUnits } from '../../lib/reader';
+import { LiveRows, ParagraphRow } from '../../lib/CaptionReader';
 import { exportCaptions } from '../../lib/export';
 import { exportDiagnostics } from '../../lib/export-diagnostics';
 import Icon from '../../lib/Icon';
@@ -18,6 +19,7 @@ export default function App() {
   const [state, setState] = useState<CaptureState>({ phase: 'idle' });
   const [captions, setCaptions] = useState<Caption[]>([]);
   const [preview, setPreview] = useState<EnglishPreview>();
+  const [drafts, setDrafts] = useState<DraftTranslations>({});
   const [connection, setConnection] = useState<Connection>();
   const [connectionError, setConnectionError] = useState('');
   const [notice, setNotice] = useState('');
@@ -46,32 +48,26 @@ export default function App() {
   translatorRef.current ??= new LocalTranslator();
 
   const sendOffscreen = useCallback((message: Record<string, unknown>) => browser.runtime.sendMessage({ target: 'offscreen', ...message }), []);
-  const canTranslate = useCallback(() => {
-    switch (settingsRef.current.translationMode) {
-      case 'offline': return Boolean(connectionRef.current?.offlineTranslationReady);
-      case 'deepseek': return Boolean(connectionRef.current?.deepseekConfigured);
-      // Keep the translation lease during instance recreation. Recovery must
-      // not discard this view's queue or stop unrelated audio capture.
-      case 'local': return Boolean(window.Translator);
-      default: return false;
-    }
-  }, []);
+  // The capture page translates with the local model or DeepSeek, so Chinese
+  // keeps coming while this panel is hidden. Only Chrome's own translator has
+  // to run in a visible page, which makes this panel its owner.
+  const canTranslate = useCallback(() => settingsRef.current.translationMode === 'local' && Boolean(window.Translator), []);
+  const viewTranslates = () => settingsRef.current.translationMode === 'local';
 
   if (!queueRef.current) queueRef.current = new TranslationQueue(async (caption, signal) => {
-    const config = settingsRef.current;
-    if (config.translationMode === 'local') return translatorRef.current!.translate(caption.text, signal);
-    if (config.translationMode === 'offline') return serviceTranslate(caption.text, config.token, [], 'offline', signal);
-    if (config.translationMode === 'deepseek') {
-      const context = captionsRef.current.filter(c => c.final && c.start < caption.start).slice(-2).map(c => c.text);
-      return serviceTranslate(caption.text, config.token, context, 'deepseek', signal);
-    }
-    throw new Error('翻译已关闭');
+    if (settingsRef.current.translationMode !== 'local') throw new Error('翻译由采音页面处理');
+    return translatorRef.current!.translate(caption.text, signal);
   }, async (caption, text) => {
     const result = await sendOffscreen({ type: 'translation', viewId: viewId.current, sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text });
     if (!result?.ok) throw new Error('字幕视图已切换，译文等待重新投递。');
   }, () => {}, { onChange: status => {
+    if (!viewTranslates()) return;
     setTranslationStatus(status); setTranslationFailed(status.failed > 0);
   } });
+  const showServiceStatus = useCallback((status?: TranslationStatus) => {
+    if (viewTranslates() || !status) return;
+    setTranslationStatus(status); setTranslationFailed(status.failed > 0);
+  }, []);
 
   const queueCaption = useCallback((caption: Caption) => {
     if (!ownerRef.current || !canTranslate() || caption.translationRevision === caption.revision) return;
@@ -103,7 +99,7 @@ export default function App() {
       else if (message.type === 'state') {
         const next: CaptureState = message.state;
         if (next.phase === 'starting') {
-          setCaptions([]); setPreview(undefined); queueRef.current!.reset(); setFollowing(true);
+          setCaptions([]); setPreview(undefined); setDrafts({}); queueRef.current!.reset(); setFollowing(true);
           setTranslationFailed(false);
         }
         stateRef.current = next; setState(next);
@@ -115,7 +111,9 @@ export default function App() {
       } else if (message.type === 'preview' && message.preview) {
         setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
       } else if (message.type === 'translation') setCaptions(previous => applyTranslation(previous, message));
-      else if (message.type === 'cleared') { setCaptions([]); setPreview(undefined); queueRef.current!.reset(); }
+      else if (message.type === 'translationStatus') showServiceStatus(message.status);
+      else if (message.type === 'draft' && message.sessionId === stateRef.current.sessionId) setDrafts(previous => ({ ...previous, [message.key]: message.text }));
+      else if (message.type === 'cleared') { setCaptions([]); setPreview(undefined); setDrafts({}); queueRef.current!.reset(); }
     };
     const storageListener = (changes: any, area: string) => {
       if (area !== 'local' || !changes.settings?.newValue) return;
@@ -123,12 +121,13 @@ export default function App() {
       if (next.translationMode !== settingsRef.current.translationMode || next.token !== settingsRef.current.token) {
         queueRef.current!.reset(); ownerRef.current = false;
         translatorRef.current!.destroy(); setTranslationFailed(false); setNotice('');
+        setTranslationStatus({ pending: 0, failed: 0, retrying: 0, running: false });
         void connect();
         if (next.translationMode === 'local' && !translatorRef.current!.ready) {
           void translatorRef.current!.availability().then(availability => {
             if (availability === 'available') return translatorRef.current!.prepare(() => {});
-            setNotice('Chrome 语言包尚未就绪。可在设置中准备，或切回本机离线翻译。');
-          }).catch(() => setNotice('Chrome 本地翻译不可用，请在设置中切回本机离线翻译。'));
+            setNotice('Chrome 语言包尚未就绪。可在设置中准备，或改用本机模型 HY-MT。');
+          }).catch(() => setNotice('Chrome 内置翻译不可用，请在设置中改用本机模型 HY-MT。'));
         }
       }
       settingsRef.current = next; setSettings(next);
@@ -145,7 +144,7 @@ export default function App() {
       ]);
       if (!mounted) return;
       setSource(selection?.source);
-      if (snapshot?.state) { stateRef.current = snapshot.state; setState(snapshot.state); setCaptions(snapshot.captions || []); setPreview(snapshot.preview); }
+      if (snapshot?.state) { stateRef.current = snapshot.state; setState(snapshot.state); setCaptions(snapshot.captions || []); setPreview(snapshot.preview); setDrafts(snapshot.drafts || {}); showServiceStatus(snapshot.translationStatus); }
       await connect();
       if (initial.translationMode === 'local' && await translatorRef.current!.availability() === 'available') {
         await translatorRef.current!.prepare(() => {});
@@ -166,7 +165,7 @@ export default function App() {
       browser.runtime.onMessage.removeListener(listener); browser.storage.onChanged.removeListener(storageListener);
       queueRef.current!.reset(); translatorRef.current?.destroy();
     };
-  }, [canTranslate, connect, queueCaption, sendOffscreen]);
+  }, [canTranslate, connect, queueCaption, sendOffscreen, showServiceStatus]);
 
   useEffect(() => {
     const update = () => setElapsed(state.startedAt ? (Date.now() - state.startedAt) / 1000 : 0);
@@ -197,7 +196,7 @@ export default function App() {
       const next = await connect();
       if (!next) return;
       const mode = settingsRef.current.translationMode;
-      if (mode === 'offline' && !next.offlineTranslationReady) throw new Error('本机翻译模型未就绪，请运行 setup.ps1 后重启服务。');
+      if (mode === 'offline' && !next.offlineTranslationReady) throw new Error(`本机翻译模型未就绪，请重新运行 ${SETUP_SCRIPT}，然后重启本机服务。`);
       if (mode === 'deepseek' && !next.deepseekConfigured) throw new Error('DeepSeek 尚未配置，请在设置中检查。');
       ownerRef.current = canTranslate();
       const result = await browser.runtime.sendMessage({ target: 'background', type: 'start', token: next.token,
@@ -205,6 +204,11 @@ export default function App() {
       if (result?.error) setNotice(result.error);
     } catch (error) { setNotice(error instanceof Error ? error.message : '启动失败。'); }
     finally { setWorking(false); }
+  }
+
+  async function toggleOverlay() {
+    const result = await browser.runtime.sendMessage({ target: 'background', type: 'overlay' }).catch(() => undefined);
+    if (!result?.ok) setNotice('请先在声音所在的网页点一次工具栏里的 NimDaydu 图标，再打开悬浮字幕。');
   }
 
   async function control(type: 'pause' | 'resume' | 'stop' | 'clear') {
@@ -218,10 +222,14 @@ export default function App() {
     setRepairing(true); setNotice('');
     // Retain successful captions and the audio session. Only repair this queue.
     try {
-      if (settingsRef.current.translationMode === 'local') await translatorRef.current!.prepare(() => {});
-      else await connect();
-      queueRef.current!.retryFailed();
-      captionsRef.current.forEach(queueCaption);
+      if (settingsRef.current.translationMode === 'local') {
+        await translatorRef.current!.prepare(() => {});
+        queueRef.current!.retryFailed();
+        captionsRef.current.forEach(queueCaption);
+      } else {
+        await connect();
+        await sendOffscreen({ type: 'retryTranslation' });
+      }
     } catch { setNotice('翻译暂未恢复，请在设置中检查语言包或本机连接。英文字幕仍保留。'); }
     finally { setRepairing(false); }
   }
@@ -233,16 +241,21 @@ export default function App() {
   const active = isActive(state.phase);
   const currentSource = active ? state.source : source || state.source;
   const waitingTranslation = !translationFailed && mode !== 'original' && captions.some(c => c.translationRevision !== c.revision);
-  const pendingLabel = waitingTranslation ? '正在翻译…' : active && state.pending && mode !== 'original' ? '正在整理译文…' : '';
+  // Rows already show live English and reserved Chinese slots; a status line
+  // that comes and goes at the bottom would only make the list jump.
+  const pendingLabel = mode !== 'translated' ? '' : waitingTranslation ? '正在翻译…' : active && state.pending ? '正在整理译文…' : '';
   const translationMessage = translationStatus.failed > 0
     ? `${translationStatus.failed} 句译文待恢复。${active ? '英文转录继续。' : '英文字幕已保留。'}`
     : translationStatus.retrying > 0 ? `翻译正在重试。${active ? '英文转录继续。' : '英文字幕已保留。'}` : '';
-  const visiblePreview = !search.trim() && mode !== 'translated' && preview?.text;
+  // Chinese-only mode shows live rows only once they have early Chinese.
+  const visiblePreview = !search.trim() && Boolean(preview?.text)
+    && (mode !== 'translated' || previewUnits(preview).some(unit => drafts[draftKey(unit)]));
 
   return <div className="app" style={{ '--caption-size': `${settings.fontSize}px` } as CSSProperties}>
     <header className="header">
       <h1>NimDaydu</h1>
       <div className="header-actions">
+        <button className="icon-button" title={`显示或隐藏网页上的悬浮字幕（${IS_MAC ? 'Option' : 'Alt'}+Shift+O）`} aria-label="显示或隐藏悬浮字幕" onClick={() => void toggleOverlay()}><Icon name="overlay"/></button>
         <button className="icon-button" title="设置" aria-label="设置" onClick={() => void browser.runtime.openOptionsPage()}><Icon name="settings"/></button>
         <div className="menu-wrap" ref={menuRef}>
           <button className="icon-button" title="更多" aria-label="更多" aria-expanded={menu} aria-haspopup="menu" onClick={() => setMenu(v => !v)}><Icon name="more"/></button>
@@ -268,7 +281,7 @@ export default function App() {
       if (element) setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 70);
     }}>
       {paragraphs.map(paragraph => <ParagraphRow key={paragraph.id} paragraph={paragraph} mode={mode}/>)}
-      {visiblePreview && <EnglishPreviewRow preview={preview} mode={mode}/>}
+      {visiblePreview && <LiveRows preview={preview} mode={mode} drafts={drafts}/>}
       {!visible.length && !visiblePreview && <div className="empty-state">
         <p className="empty-title">{search ? '没有匹配的字幕' : active ? mode === 'translated' ? '等待完整译文' : '等待语音' : checking ? '正在连接本机服务' : connectionError ? '本机服务未连接' : '开始后显示双语字幕'}</p>
         {!search && <p>{active ? mode === 'translated' ? '句子整理和翻译完成后会显示在这里。' : '英文实时显示，中文在句子完成后更新。' : connectionError || '播放网页中的声音，然后点击开始。'}</p>}

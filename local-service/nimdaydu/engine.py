@@ -1,8 +1,19 @@
 import json
 import os
+import time
 from collections.abc import Callable
 
 from .config import ROOT
+from .system import SETUP_SCRIPT
+
+UPDATE_INTERVAL = 0.5
+# A draft pass re-reads its whole current line, so it costs more as a line
+# grows. Upstream lets the interval shrink to one pass's own cost, which pins a
+# core during long continuous speech and leaves nothing for the second pass or
+# the browser. Waiting for this multiple of the last pass keeps drafts at most
+# about two thirds of one core.
+PASS_HEADROOM = 1.5
+MAX_UPDATE_INTERVAL = 5.0
 
 
 class MoonshineEngine:
@@ -15,31 +26,46 @@ class MoonshineEngine:
 
         manifest_path = ROOT / "models/manifest.json"
         if not manifest_path.exists():
-            raise RuntimeError("Model missing. Run setup.ps1 first.")
+            raise RuntimeError(f"Model missing. Run {SETUP_SCRIPT} first.")
         manifest = json.loads(manifest_path.read_text())
         if model not in manifest:
-            raise RuntimeError(f"Model '{model}' missing. Run setup.ps1 -Model {model}.")
-        self.transcriber = Transcriber(ROOT / manifest[model]["path"], ModelArch(manifest[model]["arch"]), update_interval=0.5)
+            raise RuntimeError(f"Model '{model}' missing. Run {SETUP_SCRIPT} again and choose {model}.")
+        # Manifests written on Windows before v0.6 use backslashes.
+        self.transcriber = Transcriber(ROOT / manifest[model]["path"].replace("\\", "/"), ModelArch(manifest[model]["arch"]), update_interval=UPDATE_INTERVAL)
         self.model = model
         self.stream = None
         self.emit: Callable = lambda _: None
         self.epoch = 0
         self.base_seconds = 0
         self.revisions = {}
+        self.stream_seconds = 0.0
+        self.updated_at = 0.0
+        self.last_pass = 0.0
 
     def begin(self, emit: Callable):
         self.emit = emit
         self.epoch = 0
         self.revisions.clear()
 
-    def audio(self, frame, sample_rate: int):
+    def audio(self, frame, sample_rate: int, behind: bool = False):
         if self.stream is None:
             self.epoch += 1
             self.base_seconds = frame.offset / sample_rate
-            self.stream = self.transcriber.create_stream(update_interval=0.5)
+            # The stream never schedules its own passes; see PASS_HEADROOM.
+            self.stream = self.transcriber.create_stream(update_interval=10 ** 6)
             self.stream.add_listener(self._event)
             self.stream.start()
+            self.stream_seconds = self.updated_at = self.last_pass = 0.0
         self.stream.add_audio(frame.samples.tolist(), sample_rate)
+        self.stream_seconds += len(frame.samples) / sample_rate
+        # While frames are queued, ingesting audio is cheap and a pass is not:
+        # catch up first, then let one pass cover everything that arrived.
+        needed = min(max(UPDATE_INTERVAL, PASS_HEADROOM * self.last_pass), MAX_UPDATE_INTERVAL)
+        if not behind and self.stream_seconds - self.updated_at >= needed:
+            started = time.perf_counter()
+            self.stream.update_transcription()
+            self.last_pass = time.perf_counter() - started
+            self.updated_at = self.stream_seconds
 
     def _event(self, event):
         from moonshine_voice.transcriber import Error, LineCompleted, LineTextChanged

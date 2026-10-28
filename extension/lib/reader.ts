@@ -1,4 +1,4 @@
-import type { Caption, ViewMode } from './types';
+import type { Caption, EnglishPreview, ViewMode } from './types';
 export type Paragraph = { id: string; captions: Caption[] };
 /** English is immediately readable; Chinese-only mode waits for translations. */
 export function readableCaptions(captions: Caption[], mode: ViewMode, fallback = false): Caption[] {
@@ -19,4 +19,9 @@ export function groupParagraphs(captions: Caption[]): Paragraph[] {
     else paragraphs.push({ id: group, captions: [caption] });
   }
   return paragraphs;
+}
+/** Rows of live English; older services send one paragraph without units. */
+export function previewUnits(preview?: EnglishPreview): string[] {
+  if (!preview?.text) return [];
+  return preview.units?.length ? preview.units : [preview.text];
 }
