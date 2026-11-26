@@ -1,0 +1,14 @@
+{
+  "extensionDescription": {
+    "message": "在本机实时转录网页声音，并显示中英双语字幕。"
+  },
+  "actionTitle": {
+    "message": "NimDaydu · 当前标签页字幕"
+  },
+  "openPanel": {
+    "message": "打开 NimDaydu 字幕侧栏"
+  },
+  "toggleOverlay": {
+    "message": "显示或隐藏网页悬浮字幕"
+  }
+}

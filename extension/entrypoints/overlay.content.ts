@@ -1,3 +1,6 @@
+import { defaultUiLanguage, watchUiLanguage, type UiLanguage } from '../lib/ui-language';
+import { messagesFor } from '../lib/ui-messages';
+import { IS_MAC } from '../lib/platform';
 import { browser } from 'wxt/browser';
 import { readSettings, type Settings } from '../lib/types';
 import { DEFAULT_OVERLAY_VIEW, OverlayCaptions, clampView, overlayRows, overlayVisible, type OverlayOverride, type OverlayRow, type OverlayView } from '../lib/overlay';
@@ -32,6 +35,7 @@ p{margin:0;overflow-wrap:anywhere;text-shadow:0 1px 2px rgba(0,0,0,.6)}
 .tools{position:absolute;top:-30px;right:0;display:flex;gap:4px;opacity:0;transition:opacity .15s}
 .box:hover .tools,.box:focus-within .tools{opacity:1}
 button{all:unset;cursor:pointer;font:600 11px/1 system-ui,sans-serif;color:#fff;background:rgba(12,13,16,.78);padding:6px 8px;border-radius:6px}
+button[hidden]{display:none}
 button:hover{background:rgba(48,50,58,.92)}
 button:focus-visible{outline:2px solid #8ab4f8}
 @media (prefers-reduced-motion:reduce){.caret{animation:none}}`;
@@ -59,18 +63,18 @@ function mountOverlay() {
   root.adoptedStyleSheets = [sheet];
   const box = element('div', 'box');
   const tools = element('div', 'tools');
-  const smaller = element('button', '', 'A−'); smaller.title = '缩小字幕';
-  const larger = element('button', '', 'A+'); larger.title = '放大字幕';
-  const close = element('button', '', '×'); close.title = '隐藏悬浮字幕（Alt+Shift+O 重新显示）';
+  const smaller = element('button', '', 'A−');
+  const larger = element('button', '', 'A+');
+  const close = element('button', '', '×');
   tools.append(smaller, larger, close);
-  const grip = element('div', 'grip'); grip.title = '上下拖动调整高度';
+  const grip = element('div', 'grip');
   const list = element('div', 'list');
   const status = element('p', 'status');
-  const keepListening = element('button', '', '继续听');
+  const keepListening = element('button');
   keepListening.hidden = true;
   keepListening.onclick = () => { void browser.runtime.sendMessage({ target: 'offscreen', type: 'continueListening' }); };
   box.append(tools, grip, list, status, keepListening);
-  box.title = '拖动可移动位置，双击回到底部';
+
   const lane = element('div', 'lane');
   lane.append(box);
   root.append(lane);
@@ -149,6 +153,18 @@ function mountOverlay() {
     });
   }
 
+  let t = messagesFor(defaultUiLanguage());
+  function labelControls(language: UiLanguage) {
+    t = messagesFor(language);
+    host.lang = language;
+    smaller.title = t('reduceSize');
+    larger.title = t('increaseSize');
+    close.title = t('hideOverlay', IS_MAC ? 'Option+Shift+O' : 'Alt+Shift+O');
+    grip.title = t('resizeOverlay');
+    keepListening.textContent = t('keepListening');
+    box.title = t('moveOverlay');
+  }
+
   function render(restack = false) {
     if (!alive) return;
     const clickThrough = settings.overlayClickThrough && !data.state.idleStopAt;
@@ -160,7 +176,7 @@ function mountOverlay() {
     const rows = overlayRows(data.captions, data.preview, mode, data.drafts);
     renderItems(rows, mode === 'original');
     keepListening.hidden = !data.state.idleStopAt;
-    status.textContent = data.state.idleStopAt ? '长时间无新字幕，即将自动结束。' : rows.length ? '' : data.state.phase === 'paused' ? 'NimDaydu · 已暂停' : 'NimDaydu · 等待语音';
+    status.textContent = data.state.idleStopAt ? t('overlayCountdown') : rows.length ? '' : data.state.phase === 'paused' ? t('overlayPaused') : t('overlayWaiting');
     box.classList.toggle('quiet', Date.now() - data.updatedAt > QUIET_MS);
     show(restack);
     place();
@@ -169,6 +185,7 @@ function mountOverlay() {
 
   function teardown() {
     alive = false;
+    unwatchLanguage();
     clearInterval(timer);
     hide(); host.remove(); port?.disconnect();
   }
@@ -236,6 +253,8 @@ function mountOverlay() {
     if (changes.overlayView && !drag && !resize) view = clampView(changes.overlayView.newValue as Partial<OverlayView>);
     render();
   });
+  labelControls(defaultUiLanguage());
+  const unwatchLanguage = watchUiLanguage(language => { labelControls(language); render(); });
   void browser.storage.local.get(['settings', 'overlayView']).then(stored => {
     settings = readSettings(stored.settings as Partial<Settings> | undefined);
     view = clampView(stored.overlayView as Partial<OverlayView> | undefined);

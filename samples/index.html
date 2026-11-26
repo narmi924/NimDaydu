@@ -1,6 +1,14 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>NimDaydu · 英语声音测试</title>
-<style>body{font:17px system-ui;background:#f4f6ef;color:#233d2d;max-width:700px;margin:10vh auto;padding:30px}h1{letter-spacing:-1px}p{line-height:1.8;color:#526c59}button{background:#254632;color:#eff8ef;font:inherit;padding:13px 23px;border:0;border-radius:10px;cursor:pointer}audio{display:block;margin:24px 0;width:100%}code{font-size:15px}</style>
-<h1>NimDaydu · 英语声音测试</h1><p>这是 Windows 合成的英语测试音频。先启动本机服务，在这个标签页点击 NimDaydu 图标并开始字幕，再播放声音。</p>
+<!doctype html><html lang="en"><meta charset="utf-8"><title>NimDaydu · English sample</title>
+<style>body{font:17px system-ui;background:#f4f6ef;color:#233d2d;max-width:700px;margin:10vh auto;padding:30px}h1{letter-spacing:-1px}p{line-height:1.8;color:#526c59}audio{display:block;margin:24px 0;width:100%}</style>
+<h1>NimDaydu · English sample</h1>
+<p>Open NimDaydu from the toolbar on this tab, click Start, then play the sample.</p>
 <audio controls src="english.wav"></audio>
-<p>可以验证捕获、暂停、恢复、英译中和导出。这个测试不能代替真实 Discord 通话中的口音、噪声和多人同时说话测试。</p>
+<script>
+  if (new URLSearchParams(location.search).get('lang') === 'zh-CN') {
+    document.documentElement.lang = 'zh-CN';
+    document.title = 'NimDaydu · 英语样本';
+    document.querySelector('h1').textContent = document.title;
+    document.querySelector('p').textContent = '在这个标签页点击工具栏里的 NimDaydu 图标，点击开始，然后播放样本。';
+  }
+</script>
 </html>
