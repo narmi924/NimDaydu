@@ -76,6 +76,7 @@ def test_health_and_capabilities_require_correct_local_token(service):
     client, token = service
     assert client.get('/health').json()['ready'] is True
     assert client.get('/capabilities').status_code == 401
+    assert client.get('/health').json()['translationEngine'] is None
     assert client.get('/capabilities', headers={'Authorization': 'Bearer wrong'}).status_code == 401
     assert client.get('/capabilities', headers={'Authorization': f'Bearer {token}'}).status_code == 200
     assert client.get('/pairing', headers={'Origin': 'https://evil.example'}).status_code == 403
@@ -150,7 +151,9 @@ def test_local_translation_requires_authentication_and_uses_selected_model(servi
     assert client.post('/translate', json={'text': 'Hello'}).status_code == 401
     result = client.post('/translate', headers={'Authorization': f'Bearer {token}'},
                          json={'text': 'Hello Discord'})
-    assert result.json() == {'text': '你好，Discord。', 'engine': 'Fake-MT'}
+    body = result.json()
+    assert (body['text'], body['engine']) == ('你好，Discord。', 'Fake-MT')
+    assert body['modelMs'] >= 0 and body['queueMs'] >= 0
     assert client.get('/health').json()['translationEngine'] == 'Fake-MT'
     assert client.post('/translate', headers={'Authorization': f'Bearer {token}'},
                        json={'text': 'Hello', 'provider': 'deepseek'}).status_code == 422
@@ -184,7 +187,7 @@ def test_autosave_api_preserves_late_chinese_and_requires_origin_and_token(servi
         ws.send_bytes(frame()); receive_kind(ws, 'preview')
         ws.send_json({'type': 'stop'}); caption = receive_kind(ws, 'caption'); receive_kind(ws, 'state')
     file = next(directory.rglob('session.json'))
-    assert json.loads(file.read_text())['captions'][0]['text'] == caption['text']
+    assert json.loads(file.read_text(encoding='utf-8'))['captions'][0]['text'] == caption['text']
     endpoint = f'/outputs/{key}/translations'
     payload = {'updates': [{'id': caption['id'], 'revision': caption['revision'], 'text': '完整译文。'}]}
     assert client.post(endpoint, json=payload).status_code == 403
@@ -285,3 +288,61 @@ def test_settled_captions_wait_for_the_model_while_live_drafts_give_way(tmp_path
         gate.set(); first.join(); second.join()
         assert results == {'First.': 200, 'Second.': 200}
         assert calls == ['First.', 'Second.']
+
+
+def test_corrections_update_agent_file_reject_stale_translation_and_undo(service):
+    client, token = service
+    origin = 'chrome-extension://' + json.loads((ROOT / 'extension/identity.json').read_text())['extensionId']
+    headers = {'Origin': origin, 'Authorization': 'Bearer ' + token}
+    with client.websocket_connect('ws://127.0.0.1/audio') as ws:
+        hello(ws, token)
+        key = receive_kind(ws, 'ready')['sessionId']
+        ws.send_bytes(frame()); receive_kind(ws, 'preview')
+        ws.send_json({'type': 'stop'})
+        caption = receive_kind(ws, 'caption'); receive_kind(ws, 'state')
+    path = '/terms/' + key
+    alias = caption['text'].split()[0]
+    edit = {'id': caption['id'], 'alias': alias, 'replacement': 'NimDaydu', 'scope': 'remember'}
+    assert client.post(path, headers=headers, json=edit).json()['captions'][0]['revision'] == 2
+    late = {'id': caption['id'], 'revision': 1, 'text': '过期译文'}
+    client.post('/outputs/' + key + '/translations', headers=headers, json={'updates': [late]})
+    # Chrome can omit Origin on a read-only extension GET. The token remains required.
+    assert client.get('/records/' + key).status_code == 401
+    row = client.get('/records/' + key, headers={'Authorization': 'Bearer ' + token}).json()['captions'][0]
+    assert 'NimDaydu' in row['text'] and 'translation' not in row
+    assert row['recognizedText'] == caption['text']
+    assert client.get('/records', params={'q': 'NimDaydu'}, headers=headers).json()[0]['sessionId'] == key
+    restored = client.post(path, headers=headers, json={**edit, 'scope': 'undo'}).json()['captions'][0]
+    assert restored['text'] == caption['text'] and restored['revision'] == 3
+
+
+def test_file_keeps_recognizing_and_saves_english_if_translation_is_unavailable(tmp_path, monkeypatch):
+    from importlib import import_module
+    module = import_module('nimdaydu.app')
+    def captions(_path, _model):
+        for i, text in enumerate(('First sentence.', 'Second sentence.')):
+            yield {'id': str(i), 'revision': 1, 'start': i, 'end': i + 1, 'text': text, 'final': True}
+    def unavailable():
+        raise RuntimeError('Model missing')
+    monkeypatch.setattr(module, 'SherpaRefiner', object)
+    monkeypatch.setattr(module, 'file_captions', captions)
+    with TestClient(create_app(FakeEngine, tmp_path, unavailable), base_url='http://127.0.0.1') as client:
+        headers = {'Origin': 'chrome-extension://' + json.loads((ROOT / 'extension/identity.json').read_text())['extensionId']}
+        headers['Authorization'] = 'Bearer ' + client.post('/connect', headers=headers).json()['token']
+        events = [json.loads(line) for line in client.post('/import?title=meeting.wav', content=b'audio', headers=headers).text.splitlines()]
+        assert [event['type'] for event in events] == ['caption', 'warning', 'caption', 'done']
+        assert events[-1]['missingTranslations'] == 2
+        saved = client.get('/records/' + events[-1]['sessionId'], headers=headers).json()
+        assert [c['text'] for c in saved['captions']] == ['First sentence.', 'Second sentence.']
+
+
+def test_file_sentences_cross_decoder_windows_but_not_silence():
+    from nimdaydu.media import _file_units
+    windows = [
+        ([('Hello.', 1, 2), ('Due', 10, 11), ('October', 11, 12)], 0, 12),
+        ([('9.', 12, 12.2), ('More', 23.5, 24)], 12, 24),
+        ([('Next.', 30, 31)], 24, 36),
+    ]
+    assert list(_file_units(windows)) == [
+        ('Hello.', 1, 2), ('Due October 9.', 10, 12.2), ('More', 23.5, 24), ('Next.', 30, 31),
+    ]

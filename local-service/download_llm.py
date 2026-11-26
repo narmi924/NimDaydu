@@ -16,6 +16,7 @@ BUILD = 'b11701'
 SERVERS = {
     # Vulkan uses the integrated or discrete GPU and falls back to the CPU.
     ('win32', 'AMD64'): (f'llama-{BUILD}-bin-win-vulkan-x64.zip', '571794ccf8d44351253a644cfc406bcf094cf01e902aad7f6f65e8a0859eb0af', 'llama-server.exe'),
+    ('linux', 'x86_64'): (f'llama-{BUILD}-bin-ubuntu-x64.tar.gz', '9bf78c66e0fcd0a5261fcd4e57cb376b457305a1b6562068ae8df778824aec0d', 'llama-server'),
     ('darwin', 'arm64'): (f'llama-{BUILD}-bin-macos-arm64.tar.gz', 'e4219b1442dcf0b68e860ea6f06d417163326391e8514b04019080f2444ff47c', 'llama-server'),
 }
 MODEL = ('Hy-MT2-1.8B', 'tencent/Hy-MT2-1.8B-GGUF', 'Hy-MT2-1.8B-Q4_K_M.gguf',

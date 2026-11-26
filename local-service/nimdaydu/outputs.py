@@ -58,15 +58,51 @@ class OutputStore:
                 'source': source, 'model': model, 'status': 'capturing', 'autoSaveEnabled': enabled,
                 'savingPeriods': [{'from': now(), 'to': None}] if enabled else []}}
 
+    def record_path(self, identifier):
+        return next((p for p in self.directory.glob(f'*/*_{UUID(identifier)}/session.json')
+                     if p.resolve().is_relative_to(self.directory)), None)
+
+    def find_records(self, query, aliases=None):
+        results = []
+        term = query.strip().casefold()
+        matches = {term} if term else set()
+        for alias, spelling in (aliases or {}).items():
+            if term and (term in alias.casefold() or term in spelling.casefold()):
+                matches.update((alias.casefold(), spelling.casefold()))
+        for path in sorted(self.directory.glob('*/*/session.json'), reverse=True):
+            if not path.resolve().is_relative_to(self.directory):
+                continue
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                identifier = str(UUID(data['sessionId']))
+                source = data['source']
+                if term and not any(any(key in str(value).casefold() for key in matches) for value in (
+                        data['startedAt'], *source.values(), *(c.get(k, '') for c in data['captions'] for k in ('text', 'translation', 'recognizedText')))):
+                    continue
+                results.append({'sessionId': identifier, 'startedAt': data['startedAt'], 'source': source,
+                                'count': len(data['captions']), 'searchTerms': sorted(matches)})
+            except (OSError, KeyError, ValueError, TypeError):
+                continue
+        return results
+
     def caption(self, identifier, caption):
         session = self.sessions.get(identifier)
         if not session or not session['enabled'] or not caption.get('final'):
             return
         # The assembler's internal preview must not be saved with the final.
         saved = {key: caption[key] for key in ['id', 'revision', 'final', 'text', 'start', 'end',
-                 'paragraph', 'incomplete', 'continued', 'rawText'] if key in caption}
+                 'paragraph', 'incomplete', 'continued', 'rawText', 'recognizedText'] if key in caption}
         session['captions'].setdefault(saved['id'], saved)
         session['dirty'] = True
+
+    def revise(self, identifier, caption):
+        session = self.sessions.get(identifier)
+        if session and session['enabled'] and caption['id'] in session['captions']:
+            old = session['captions'][caption['id']]
+            old.update({key: caption[key] for key in ('text', 'revision', 'recognizedText') if key in caption})
+            old.pop('translation', None)
+            old.pop('translationRevision', None)
+            session['dirty'] = True
 
     def translations(self, identifier, updates):
         session = self.sessions.get(identifier)

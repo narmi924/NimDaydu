@@ -33,144 +33,87 @@ def test_window_bounds_memory_and_does_not_join_across_pause_gaps():
     assert len(window.slice(10, 10.08)) == 1280
 
 
-def test_second_pass_keeps_drafts_immediate_and_publishes_final_only_after_acoustic_result():
-    gate = threading.Event()
-    class Refiner:
-        def transcribe(self, samples, rate):
-            assert len(samples) == 1280 and rate == 16000
-            gate.wait(2); return 'Corrected words.'
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
-    events = []; engine.begin(events.append)
-    engine.audio(AudioFrame(0, 0, np.zeros(1280, dtype=np.float32)), 16000)
-    engine.draft.emit(line())
-    assert events[0]['text'] == 'Original spoken words.' and events[0]['final'] is False
-    gate.set(); engine.pause()
+class Acoustic:
+    def transcribe(self, samples, rate):
+        return 'Actual spoken words.', [('Actual', .12, .22), ('spoken', .25, .29), ('words.', .3, .55)]
+
+
+def packet(index=0, seconds=.8, offset=0):
+    return AudioFrame(index, offset, np.full(round(seconds*16000), .05, dtype=np.float32))
+
+
+def test_audio_without_any_native_draft_is_still_recognized_and_timed():
+    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Acoustic)
+    events = []
+    engine.begin(events.append)
+    engine.audio(packet(), 16000)
+    engine.finish()
     finals = [e for e in events if e.get('final')]
-    assert len(finals) == 1 and finals[0]['text'] == 'Corrected words.' and finals[0]['revision'] == 3
-    assert engine.metrics()['completed'] == 1
+    assert [(e['text'], e['start'], e['end']) for e in finals] == [('Actual spoken words.', .12, .55)]
+    assert finals[0]['wordTimes'][2] == ('words.', .3, .55)
     engine.close()
 
 
-def test_refiner_failure_preserves_acoustic_text_and_does_not_stop_capture():
-    class Refiner:
-        def transcribe(self, *_): raise RuntimeError('Synthetic failure')
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
-    events = []; engine.begin(events.append)
-    engine.audio(AudioFrame(0, 0, np.zeros(1280, dtype=np.float32)), 16000)
-    engine.draft.emit(line()); engine.pause()
+def test_retracting_draft_does_not_cancel_independent_audio_or_leave_stale_preview():
+    from nimdaydu.segmentation import SentenceAssembler
+    events = []
+    assembler = SentenceAssembler(events.append)
+    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Acoustic)
+    engine.begin(assembler.feed)
+    engine.audio(packet(), 16000)
+    engine.draft.emit({**line(), 'text': 'Noisy live guess', 'final': False})
+    assert any(e.get('type') == 'preview' and 'guess' in e['text'] for e in events)
+    engine.draft.emit({'type': 'retract', 'id': 'one'})
+    engine.pause()
+    assembler.flush()
+    assert [e['text'] for e in events if e['type'] == 'caption'] == ['Actual spoken words.']
+    assert not assembler.lines
+    engine.close()
+
+
+def test_refiner_error_preserves_live_words_and_capture_can_resume():
+    class Broken:
+        def transcribe(self, *_):
+            raise RuntimeError('Unavailable model')
+    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Broken)
+    events = []
+    engine.begin(events.append)
+    engine.audio(packet(), 16000)
+    engine.draft.emit(line())
+    engine.pause()
     assert [e['text'] for e in events if e.get('final')] == ['Original spoken words.']
     assert any(e['type'] == 'warning' for e in events)
-    assert not any(e['type'] == 'error' for e in events)
-    assert engine.metrics()['failures'] == 1
+    engine.audio(packet(1, .8, 32000), 16000)
+    engine.draft.emit({**line('two'), 'start': 2, 'end': 2.5, 'text': 'Next.'})
+    engine.finish()
+    assert [e['start'] for e in events if e.get('final')] == [0, 2]
     engine.close()
 
 
-def test_refinement_backlog_is_bounded_and_never_publishes_a_sentence_twice():
-    gate = threading.Event()
-    class Refiner:
-        def transcribe(self, *_): gate.wait(2); return 'Refined.'
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
-    events = []; engine.begin(events.append)
-    engine.audio(AudioFrame(0, 0, np.zeros(1280, dtype=np.float32)), 16000)
-    for identifier in ['one', 'two', 'three']:
-        engine.draft.emit(line(identifier))
-    assert len(engine.tasks) <= 2
-    assert [event['id'] for event in events if event.get('final')] == ['three']
-    gate.set(); engine.pause()
-    finals = [event['id'] for event in events if event.get('final')]
-    assert sorted(finals) == ['one', 'three', 'two'] and len(set(finals)) == len(finals)
-    engine.close()
-
-
-def test_pause_timeout_retains_original_and_late_results_cannot_cross_sessions(monkeypatch):
+def test_timed_out_job_cannot_publish_into_new_session(monkeypatch):
     import nimdaydu.refinement as module
-    monkeypatch.setattr(module, 'FINISH_TIMEOUT', .01)
+    monkeypatch.setattr(module, 'FINISH_TIMEOUT', .015)
     gate = threading.Event()
-    class Refiner:
-        def transcribe(self, *_): gate.wait(2); return 'Late old sentence.'
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
+    class Slow(Acoustic):
+        def transcribe(self, *args):
+            gate.wait(2)
+            return super().transcribe(*args)
+    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Slow)
     old = []; engine.begin(old.append)
-    engine.audio(AudioFrame(0, 0, np.zeros(1280, dtype=np.float32)), 16000)
-    engine.draft.emit(line()); engine.pause()
-    assert [event['text'] for event in old if event.get('final')] == ['Original spoken words.']
+    engine.audio(packet(), 16000)
+    engine.draft.emit(line())
+    engine.pause()
+    assert len([e for e in old if e.get('final')]) == 1
     new = []; engine.begin(new.append)
     gate.set(); engine.close()
-    assert not any(event.get('text') == 'Late old sentence.' for event in new + old)
+    assert not new
 
 
-def test_forced_overlapping_native_regions_are_re_recognized_once_as_a_union():
-    regions = []
-    class Refiner:
+def test_same_words_in_acoustic_context_are_owned_once():
+    from nimdaydu.refinement import recognize_region
+    class Neighbor:
         def transcribe(self, samples, rate):
-            regions.append(len(samples) / rate)
-            return 'A brilliant future opened before them.'
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
-    events = []; engine.begin(events.append)
-    engine.audio(AudioFrame(0, 0, np.zeros(176000, dtype=np.float32)), 16000)
-    engine.draft.emit({**line('first'), 'text': 'A brilliant future opened before', 'start': 0, 'end': 10})
-    engine.draft.emit({**line('second'), 'final': False, 'text': 'before them', 'start': 9.5, 'end': 10.8})
-    engine.draft.emit({**line('second'), 'text': 'before them.', 'start': 9.5, 'end': 11})
-    engine.pause()
-    assert regions == [11]
-    assert {event['id'] for event in events if event['type'] == 'caption'} == {'first'}
-    assert [event['text'] for event in events if event.get('final')] == ['A brilliant future opened before them.']
-    engine.close()
-
-
-def test_shifted_tail_cannot_leave_a_stale_preview_blocking_later_sentences():
-    from nimdaydu.segmentation import SentenceAssembler
-    class Refiner:
-        def transcribe(self, *_): return 'This is complete.'
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
-    now = [0.0]
-    events = []
-    assembler = SentenceAssembler(events.append, clock=lambda: now[0])
-    engine.begin(assembler.feed)
-    engine.audio(AudioFrame(0, 0, np.zeros(160000, dtype=np.float32)), 16000)
-    engine.draft.emit({**line('held'), 'text': 'Got it.', 'start': 0, 'end': 1})
-    for revision in range(2, 6):
-        engine.draft.emit({**line('tail'), 'revision': revision, 'final': False,
-                           'text': 'We are trying', 'start': 1.2, 'end': 2})
-    # Native timing can shift forward while the tail is being recognized.
-    engine.draft.emit({**line('tail'), 'revision': 6, 'text': 'We are trying this.', 'start': 3, 'end': 4})
-    engine.pause()
-    now[0] = 3
-    assembler.tick()
-    assert not assembler.lines
-    assert len([event for event in events if event['type'] == 'caption']) == 2
-    assert assembler.last_preview[0] == ''
-    engine.close()
-
-
-def test_retracted_live_tail_releases_the_held_acoustic_predecessor():
-    from nimdaydu.segmentation import SentenceAssembler
-    class Refiner:
-        def transcribe(self, samples, rate):
-            assert len(samples) == 1280
-            return 'The acoustic result.'
-    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
-    now = [0.0]; events = []
-    assembler = SentenceAssembler(events.append, clock=lambda: now[0])
-    engine.begin(assembler.feed)
-    engine.audio(AudioFrame(0, 0, np.zeros(2560, dtype=np.float32)), 16000)
-    engine.draft.emit({**line('held'), 'text': 'Got it.'})
-    engine.draft.emit({**line('tail'), 'final': False, 'text': 'Noisy temporary words', 'start': .08, 'end': .16})
-    engine.draft.emit({'type': 'retract', 'id': 'tail', 'revision': 3})
-    engine.pause(); now[0] = 3; assembler.tick()
-    assert not assembler.lines
-    assert [event['text'] for event in events if event['type'] == 'caption'] == ['The acoustic result.']
-    engine.close()
-
-
-def test_overlapping_regions_do_not_repeat_boundary_words():
-    from nimdaydu.refinement import drop_repeated_start
-    assert drop_repeated_start('we open the booking', 'the booking form opens.') == 'Form opens.'
-    assert drop_repeated_start('we open the booking', 'Booking') == 'Booking'
-    assert drop_repeated_start('we open the form', 'and then we pay.') == 'and then we pay.'
-    engine = RefinedEngine.__new__(RefinedEngine)
-    engine.last_final = None
-    first = engine._final({'id': 'a', 'revision': 1, 'start': 0, 'end': 10.4}, 'Then we open the booking')
-    second = engine._final({'id': 'b', 'revision': 1, 'start': 9.9, 'end': 14}, 'the booking form opens.')
-    later = engine._final({'id': 'c', 'revision': 1, 'start': 15, 'end': 16}, 'Form opens again.')
-    assert first['text'] == 'Then we open the booking' and second['text'] == 'Form opens.'
-    assert later['text'] == 'Form opens again.' and later['final'] and later['revision'] == 2
+            return 'old yes yes next', [('old', 0, .1), ('yes', .75, .85),
+                                        ('yes', 1.1, 1.2), ('next', 1.55, 1.65)]
+    words = recognize_region(Neighbor(), np.ones(32000, dtype=np.float32), 16000, 0, .5, 1.45)
+    assert [w for w, _, _ in words] == ['yes', 'yes']

@@ -9,7 +9,7 @@ IS_WINDOWS = sys.platform == 'win32'
 IS_MAC = sys.platform == 'darwin'
 PLATFORM = 'windows' if IS_WINDOWS else 'mac' if IS_MAC else sys.platform
 SETUP_SCRIPT = 'setup.ps1' if IS_WINDOWS else 'setup.sh'
-START_SCRIPT = 'Start-NimDaydu.cmd' if IS_WINDOWS else 'Start-NimDaydu.command'
+START_SCRIPT = 'Start-NimDaydu.cmd' if IS_WINDOWS else 'Start-NimDaydu.command' if IS_MAC else 'start.sh'
 
 
 def prefer_performance():

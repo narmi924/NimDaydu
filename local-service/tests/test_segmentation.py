@@ -161,6 +161,8 @@ def test_long_sentence_becomes_clause_units_that_translate_separately():
 def test_short_sentences_and_unbreakable_clauses_stay_whole():
     from nimdaydu.segmentation import split_units
     assert split_units('Make a huge comeback on day number two.') == ['Make a huge comeback on day number two.']
+    phrase = "The signals mean we would have to reprogram it every now and again."
+    assert split_units(phrase) == [phrase]
     run_on = 'We spent the whole afternoon reviewing every single field in the booking form together yesterday.'
     assert split_units(run_on) == [run_on]
     parts = split_units("They kind of come into Twitch streamers' chats, or they kind of interact with more people "
@@ -173,7 +175,7 @@ def test_live_preview_is_already_cut_into_stable_rows():
     assembler, now, emitted = setup()
     assembler.feed(line('a', 'Check availability. It is like after you select the package, it shows the departure', final=False))
     preview = [event for event in emitted if event['type'] == 'preview'][-1]
-    assert preview['units'] == ['Check availability.', 'It is like after you select the package, it shows the departure']
+    assert preview['units'] == ['Check availability.', 'It is like after you select the package,', 'it shows the departure']
     # Rows already cut never move as the speaker continues.
     spoken = ("It is like after you select the package, it shows the departure, and then you select the tour group "
               "because the tour group is based on the departure date.")
@@ -186,3 +188,18 @@ def test_live_preview_is_already_cut_into_stable_rows():
         previous = units
     assert split_units(spoken) == ['It is like after you select the package,', 'it shows the departure, and then you select the tour group',
                                    'because the tour group is based on the departure date.']
+
+
+def test_unchanged_english_can_become_ready_for_early_translation_without_committing_it():
+    assembler, _, emitted = setup()
+    draft = line('a', 'We will ship on Monday', final=False)
+    assembler.feed(draft)
+    assembler.feed({**draft, 'revision': 2, 'speechEnded': True})
+    previews = [e for e in emitted if e['type'] == 'preview']
+    assert [p['speechEnded'] for p in previews] == [False, True]
+    assert previews[1]['revision'] > previews[0]['revision']
+    assert not captions(emitted)
+    assembler.feed({**draft, 'text': 'We will ship on Monday if we can', 'revision': 3, 'speechEnded': True})
+    assert not [e for e in emitted if e['type'] == 'preview'][-1]['speechEnded']
+    assembler.feed({**draft, 'text': "We agreed that we shouldn't", 'revision': 4, 'speechEnded': True})
+    assert not [e for e in emitted if e['type'] == 'preview'][-1]['speechEnded']

@@ -3,6 +3,7 @@ import hmac
 import html
 import json
 import logging
+import tempfile
 import os
 import time
 import uuid
@@ -14,16 +15,19 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
+from anyio import CancelScope
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .config import ROOT, load_settings
 from .system import PLATFORM, SETUP_SCRIPT, prefer_performance
-from .refinement import create_engine
+from .refinement import SherpaRefiner, create_engine
+from .media import file_captions
 from .protocol import FrameOrder, Hello, parse_frame
 from .translation import create_translator
+from .terms import CaptionTerms, replace_terms
 from .segmentation import SentenceAssembler
 from .outputs import OutputStore
 
@@ -61,6 +65,13 @@ class SavingSettings(BaseModel):
     enabled: bool
 
 
+class TermEdit(BaseModel):
+    id: str = Field(max_length=64)
+    scope: Literal['line', 'session', 'remember', 'undo']
+    alias: str = Field(default='', max_length=100)
+    replacement: str = Field(default='', max_length=100)
+
+
 class SavedTranslation(BaseModel):
     id: str = Field(pattern=r'^sentence:\d+$', max_length=100)
     revision: int = Field(ge=1)
@@ -77,6 +88,7 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
     engine = None
     engine_error = None
     offline_translator = None
+    translation_load = None
     translation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nimdaydu-translate')
     busy = False
     loading = False
@@ -85,26 +97,38 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
     identity = json.loads((ROOT / 'extension/identity.json').read_text(encoding='utf-8'))
     extension_origin = f"chrome-extension://{identity['extensionId']}"
     outputs = OutputStore(output_dir or (state_dir / 'outputs' if state_dir else ROOT / 'OUTPUTS'))
+    terms = CaptionTerms(state_dir or ROOT / '.nimdaydu')
 
     async def native(fn, *args):
         return await asyncio.get_running_loop().run_in_executor(executor, partial(fn, *args))
+
+    def warm_translation():
+        nonlocal translation_load
+        async def load():
+            nonlocal offline_translator
+            try:
+                offline_translator = await asyncio.get_running_loop().run_in_executor(translation_executor, translator_factory or create_translator)
+            except Exception:
+                log.warning('Local translation model unavailable. Run %s.', SETUP_SCRIPT, exc_info=True)
+        if translation_load is None:
+            translation_load = asyncio.create_task(load())
+        return translation_load
+
+    def translation_state():
+        if offline_translator:
+            return 'ready'
+        return 'idle' if translation_load is None else 'failed' if translation_load.done() else 'loading'
 
     @asynccontextmanager
     async def lifespan(_app):
         nonlocal engine, engine_error, offline_translator
         prefer_performance()
-        translation_load = asyncio.get_running_loop().run_in_executor(translation_executor, translator_factory or create_translator)
         try:
             engine = await native(engine_factory or create_engine, settings.model)
             log.info("Local ASR ready: %s (CPU)", settings.model)
         except Exception:
             engine_error = f"Model could not load. Run {SETUP_SCRIPT} or read .nimdaydu/service.err.log."
             log.exception("ASR initialization failed")
-        try:
-            offline_translator = await translation_load
-            log.info('Local translation ready: %s', getattr(offline_translator, 'name', 'offline'))
-        except Exception:
-            log.warning('Offline translation model unavailable. Run %s.', SETUP_SCRIPT, exc_info=True)
         output_task = asyncio.create_task(outputs.run())
         try:
             yield
@@ -114,6 +138,8 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
             await outputs.flush()
             if engine:
                 await native(engine.close)
+            if translation_load:
+                await translation_load
             if offline_translator and hasattr(offline_translator, 'close'):
                 await asyncio.get_running_loop().run_in_executor(translation_executor, offline_translator.close)
             executor.shutdown(wait=True)
@@ -157,10 +183,12 @@ def create_app(engine_factory=None, state_dir: Path | None = None, translator_fa
         return Response(headers={'Access-Control-Allow-Origin': extension_origin, 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Content-Type'})
 
     @app.post('/connect')
-    async def connect(request: Request):
+    async def connect(request: Request, warm: bool = False):
         verify_extension(request)
+        if warm:
+            warm_translation()
         return JSONResponse({'token': settings.token, 'ready': engine is not None and not loading, 'model': settings.model,
-                             'offlineTranslationReady': offline_translator is not None,
+                             'offlineTranslationReady': offline_translator is not None, 'translationState': translation_state(),
                              'translationEngine': getattr(offline_translator, 'name', None), 'platform': PLATFORM,
                              'version': VERSION, 'error': engine_error, 'outputDirectory': str(outputs.directory)},
                             headers={'Access-Control-Allow-Origin': extension_origin})
@@ -241,18 +269,23 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
     @app.post("/translate")
     async def translate(body: TranslationRequest, authorization: str | None = Header(default=None)):
         authorize(authorization)
+        await asyncio.shield(warm_translation())
         if not offline_translator:
             raise HTTPException(status_code=503, detail=f'Offline translation model missing. Run {SETUP_SCRIPT}.')
         if body.draft and translate_lock.locked():
             raise HTTPException(status_code=429, detail='Translation busy')
+        submitted = time.perf_counter()
         try:
             # Settled captions queue behind at most one running request.
             await asyncio.wait_for(translate_lock.acquire(), timeout=8)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=429, detail='Translation busy') from None
         try:
+            started = time.perf_counter()
             translated = await asyncio.get_running_loop().run_in_executor(translation_executor, offline_translator.translate, body.text)
-            return {'text': translated, 'engine': getattr(offline_translator, 'name', None)}
+            return {'text': translated, 'engine': getattr(offline_translator, 'name', None),
+                    'modelMs': round((time.perf_counter() - started) * 1000),
+                    'queueMs': round((started - submitted) * 1000)}
         except ValueError:
             raise HTTPException(status_code=413, detail='Caption too long for the local model') from None
         except Exception:
@@ -260,6 +293,111 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
             raise HTTPException(status_code=502, detail='Local translation failed') from None
         finally:
             translate_lock.release()
+
+    @app.get('/sample/')
+    async def sample_page():
+        return FileResponse(ROOT / 'samples/index.html')
+
+    @app.get('/sample/english.wav')
+    async def sample_audio():
+        return FileResponse(ROOT / 'samples/english.wav', media_type='audio/wav')
+
+    @app.get('/records')
+    async def records(q: str = '', authorization: str | None = Header(default=None)):
+        authorize(authorization)
+        return await asyncio.to_thread(outputs.find_records, q, dict(terms.saved))
+
+    @app.post('/terms/{session_id}')
+    async def edit_term(session_id: UUID, body: TermEdit, request: Request, authorization: str | None = Header(default=None)):
+        verify_extension(request); authorize(authorization)
+        if str(session_id) != terms.session:
+            raise HTTPException(status_code=409, detail='字幕会话已经切换。')
+        try:
+            changes = terms.change(body.id, body.scope, body.alias, body.replacement)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+        for caption in changes:
+            outputs.revise(str(session_id), caption)
+        saved = await outputs.flush(str(session_id))
+        return {'captions': changes, 'saved': saved}
+
+    @app.get('/records/{session_id}')
+    async def record(session_id: UUID, authorization: str | None = Header(default=None)):
+        authorize(authorization)
+        path = await asyncio.to_thread(outputs.record_path, str(session_id))
+        if not path:
+            raise HTTPException(status_code=404, detail='Record not found')
+        return FileResponse(path, media_type='application/json')
+
+    @app.post('/import')
+    async def import_media(request: Request, title: str, bilingual: bool = True, save: bool = True,
+                           authorization: str | None = Header(default=None)):
+        nonlocal busy
+        verify_extension(request); authorize(authorization)
+        if busy or loading:
+            raise HTTPException(status_code=409, detail='请先结束当前转录。')
+        if not title.strip() or len(title) > 500:
+            raise HTTPException(status_code=422, detail='文件名无效。')
+        work = tempfile.TemporaryDirectory(prefix='nimdaydu-import-')
+        path = Path(work.name) / 'input'
+        busy = True
+        try:
+            with path.open('wb') as target:
+                async for chunk in request.stream():
+                    if chunk:
+                        await asyncio.to_thread(target.write, chunk)
+        except BaseException:
+            busy = False
+            work.cleanup()
+            raise
+        async def lines():
+            nonlocal busy
+            key = str(uuid.uuid4())
+            source = {'title': title, 'site': 'Local file', 'host': ''}
+            stream = None
+            missing_translations = 0
+            outputs.begin(key, save, source, 'parakeet')
+            try:
+                refiner = getattr(engine, 'refiner', None) or await native(SherpaRefiner)
+                stream = file_captions(path, refiner)
+                if bilingual:
+                    warm_translation()
+                while (caption := await native(next, stream, None)) is not None:
+                    spelling = replace_terms(caption['text'], terms.saved)
+                    if spelling != caption['text']:
+                        caption = {**caption, 'recognizedText': caption['text'], 'text': spelling}
+                    outputs.caption(key, caption)
+                    yield json.dumps({'type': 'caption', 'sessionId': key, **caption}, ensure_ascii=False) + '\n'
+                    if bilingual:
+                        try:
+                            result = await translate(TranslationRequest(text=caption['text']), authorization)
+                        except HTTPException:
+                            missing_translations += 1
+                            if missing_translations == 1:
+                                yield json.dumps({'type': 'warning', 'sessionId': key, 'message': '部分中文未译出，英文转录继续。'}, ensure_ascii=False) + '\n'
+                            continue
+                        update = {'id': caption['id'], 'revision': 1, 'text': result['text']}
+                        outputs.translations(key, [update])
+                        yield json.dumps({'type': 'translation', 'sessionId': key, **update}, ensure_ascii=False) + '\n'
+                outputs.status(key, 'stopped')
+                if not await outputs.flush(key):
+                    raise ValueError('无法写入字幕文件。')
+                yield json.dumps({'type': 'done', 'sessionId': key, 'missingTranslations': missing_translations}) + '\n'
+            except Exception as error:
+                outputs.status(key, 'error')
+                yield json.dumps({'type': 'error', 'message': str(error) if isinstance(error, ValueError) else '文件转录失败。'}, ensure_ascii=False) + '\n'
+            finally:
+                if outputs.sessions.get(key, {}).get('document', {}).get('status') == 'capturing':
+                    outputs.status(key, 'disconnected')
+                try:
+                    with CancelScope(shield=True):
+                        if stream:
+                            await native(stream.close)
+                        await outputs.flush(key)
+                finally:
+                    busy = False
+                    work.cleanup()
+        return StreamingResponse(lines(), media_type='application/x-ndjson')
 
     @app.websocket("/audio")
     async def audio_socket(ws: WebSocket):
@@ -291,6 +429,7 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
 
         def enqueue(message):
             if message.get('type') == 'caption' and message.get('final'):
+                message = terms.caption(message)
                 outputs.caption(session_id, message)
             elif message.get('type') == 'state':
                 outputs.status(session_id, message['state'])
@@ -374,6 +513,7 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
             if any(len(value) > 500 for value in hello.source.values()):
                 raise ValueError('Source metadata too long')
             outputs.begin(session_id, hello.autoSave, hello.source, settings.model)
+            terms.begin(session_id)
             capture_metrics = metrics
             metrics['sampleRate'] = hello.sampleRate
             await native(engine.begin, emit)

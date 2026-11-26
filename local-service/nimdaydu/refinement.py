@@ -11,7 +11,7 @@ import numpy as np
 
 from .config import ROOT
 from .engine import MoonshineEngine
-from .segmentation import weak, join_fragments
+from .segmentation import join_fragments
 from .system import SETUP_SCRIPT
 
 # Second-pass models from the sherpa-onnx releases: name -> (directory, archive SHA256).
@@ -21,11 +21,6 @@ REFINERS = {
 }
 REFINER_CHOICE = ROOT / 'models/refiner.json'
 FINISH_TIMEOUT = 5.0
-# Unfinished lines wait for their continuation before the second pass. In
-# continuous conversation that chain can grow until it hits this bound, and the
-# whole span is finalized (and translated) only then. 15 s keeps meetings
-# readable; Moonshine's own forced splits come every ~10 s.
-MAX_MERGE_SECONDS = 15.0
 
 
 def selected_refiner():
@@ -33,17 +28,6 @@ def selected_refiner():
     if REFINER_CHOICE.exists():
         return json.loads(REFINER_CHOICE.read_text(encoding='utf-8'))['refiner']
     return 'parakeet-v3'
-
-
-def drop_repeated_start(previous, current):
-    """Remove words a neighbouring overlapping region already recognized."""
-    left = list(re.finditer(r"\w+(?:['’-]\w+)*", previous))
-    right = list(re.finditer(r"\w+(?:['’-]\w+)*", current))
-    for size in range(min(6, len(left), len(right) - 1), 0, -1):
-        if [word.group().lower() for word in left[-size:]] == [word.group().lower() for word in right[:size]]:
-            rest = current[right[size - 1].end():].lstrip(' ,;:-')
-            return rest[:1].upper() + rest[1:]
-    return current
 
 
 def join_drafts(previous, current, overlap=False):
@@ -102,204 +86,253 @@ class SherpaRefiner:
         self.recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(directory / 'encoder.int8.onnx'), decoder=str(directory / 'decoder.int8.onnx'),
             joiner=str(directory / 'joiner.int8.onnx'), tokens=str(directory / 'tokens.txt'),
-            model_type='nemo_transducer', num_threads=threads, provider='cpu')
+            model_type='nemo_transducer', num_threads=threads, provider='cpu', blank_penalty=1.25)
 
     def transcribe(self, samples, rate):
         stream = self.recognizer.create_stream()
         stream.accept_waveform(rate, samples)
         self.recognizer.decode_stream(stream)
-        return stream.result.text.strip()
+        result = stream.result
+        spans = []
+        for token, start, duration in zip(result.tokens, result.timestamps, result.durations):
+            if not spans or token[:1].isspace():
+                spans.append([token.strip(), start, start + duration])
+            else:
+                spans[-1][0] += token
+                spans[-1][2] = start + duration
+        return result.text.strip(), spans
+
+
+def recognize_region(model, samples, rate, origin, start, end, speech=()):
+    """Recover audible holes by decoding the same sound with different context."""
+    if not np.any(samples):
+        return []
+
+    def decode(left, right):
+        first = max(0, round((left - origin) * rate))
+        last = min(len(samples), round((right - origin) * rate))
+        if last <= first:
+            return []
+        text, spans = model.transcribe(samples[first:last], rate)
+        if text and not spans:
+            raise ValueError('The recognizer returned text without word timestamps.')
+        t = origin + first / rate
+        return [(w, max(start, t + a), min(end, t + b)) for w, a, b in spans if start <= t + (a + b) / 2 < end]
+
+    primary = decode(origin, origin + len(samples) / rate)
+    if not speech:
+        return primary
+    # A quiet turn can disappear from an otherwise valid result. Only retry a
+    # hole when the independent streaming recognizer actually heard words there.
+    gaps = zip([start, *(b for _, _, b in primary)], [*(a for _, a, _ in primary), end])
+    reread = {}
+    for left, boundary in gaps:
+        if boundary - left < .85:
+            continue
+        candidates = [d for d in speech if min(boundary, d['end']) - max(left, d['start']) >= .65]
+        if not candidates:
+            continue
+        region = max(candidates, key=lambda d: min(boundary, d['end']) - max(left, d['start']))
+        bounds = region['start'], region['end']
+        if bounds not in reread:
+            reread[bounds] = decode(*bounds)
+        for word, a, b in reread[bounds]:
+            mid = (a + b) / 2
+            if left <= mid < boundary and not any(
+                    abs((x + y) / 2 - mid) < .5 and w.casefold().strip('.,!?') == word.casefold().strip('.,!?')
+                    for w, x, y in primary):
+                primary.append((word, a, b))
+    primary.sort(key=lambda w: w[1])
+    return primary
 
 
 class RefinedEngine:
-    """Fast Moonshine drafts; serialize Parakeet finalizations separately.
+    """Keep native English drafts live while Parakeet reads every sample in order."""
+    STRIDE = 5.6
+    HISTORY = 5.0
+    LOOKAHEAD = 1.0
 
-    The acoustic draft never becomes canonical until its second pass completes.
-    Errors/overload retain the original acoustic result and report degradation.
-    """
-    def __init__(self, model='hybrid', draft_factory=MoonshineEngine, refiner_factory=SherpaRefiner):
+    def __init__(self, model='hybrid', draft_factory=None, refiner_factory=SherpaRefiner):
         self.refiner = refiner_factory()
-        self.draft = draft_factory('small')
+        self.draft = draft_factory('small') if draft_factory else MoonshineEngine('small', max_segment_seconds=6.0)
         self.model = 'hybrid'
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='nimdaydu-refine')
-        self.lock = threading.RLock()
-        self.condition = threading.Condition(self.lock)
+        self.condition = threading.Condition(threading.RLock())
         self.window = AudioWindow()
-        self.pending = {}
-        self.tasks = set()
-        self.generation = 0
         self.emit = lambda _: None
-        self.warning = False
-        self.held = None
-        self.held_live = False
-        self.held_at = 0
-        self.revisions = {}
-        self.last_final = None
+        self.pending = {}
+        self._reset()
+
+    def _reset(self):
+        self.window.clear()
+        self.drafts = {}
+        self.sequence = self.revision = 0
+        self.next_start = self.confirmed = self.boundary = None
+        self.last_preview = None
+        self.last_word = None
+        self.quiet_seconds = self.recent_level = 0.0
         self.stats = {'completed': 0, 'fallbacks': 0, 'failures': 0, 'maxRefinementMs': 0, 'inferenceSeconds': 0.0}
 
     def begin(self, emit):
-        with self.lock:
-            self.generation += 1
-            self.pending.clear(); self.window.clear()
+        with self.condition:
+            self._reset()
             self.emit = emit
-            self.warning = False
-            self.held = None; self.held_live = False; self.revisions.clear(); self.last_final = None
-            self.stats = {'completed': 0, 'fallbacks': 0, 'failures': 0, 'maxRefinementMs': 0, 'inferenceSeconds': 0.0}
         self.draft.begin(self._event)
 
-    def audio(self, packet, rate, behind=False):
-        self.window.append(packet, rate)
-        self.draft.audio(packet, rate, behind)
-        with self.lock:
-            if self.held and not self.held_live and self.window.end / rate - self.held_at >= .8:
-                self._flush_held()
+    def _tail(self, start, end):
+        parts = []
+        for d in self.drafts.values():
+            if d['end'] <= start or d['start'] >= end:
+                continue
+            # Only the provisional display uses estimated word positions.
+            # The immutable subtitle below uses Parakeet token timestamps.
+            tokens = d['text'].split()
+            span = max(.001, d['end'] - d['start'])
+            a = max(0, round((start - d['start']) / span * len(tokens)))
+            b = len(tokens) if end >= d['end'] else max(0, round((end - d['start']) / span * len(tokens)))
+            if tokens[a:b]:
+                parts.append((d, ' '.join(tokens[a:b])))
+        if not parts:
+            return None
+        text = ''
+        last_end = 0
+        for d, portion in parts:
+            text = join_drafts(text, portion, d['start'] < last_end) if text else portion
+            last_end = d['end']
+        return {'text': text, 'start': max(start, parts[0][0]['start']), 'end': min(end, last_end),
+                'inferenceMs': parts[-1][0].get('inferenceMs', 0), 'speechEnded': parts[-1][0]['final']}
 
-    def _final(self, message, text):
-        # Regions only overlap when the merge bound split a continuous chain
-        # inside Moonshine's ~0.5 s overlap; both passes then hear those words.
-        previous = self.last_final
-        if previous and previous['start'] < message['start'] < previous['end']:
-            text = drop_repeated_start(previous['text'], text)
-        self.last_final = {'start': message['start'], 'end': message['end'], 'text': text}
-        return {**message, 'text': text, 'final': True, 'revision': message['revision'] + 1}
-
-    def _fallback(self, message):
-        self.stats['fallbacks'] += 1
-        self.warning = True
-        self.emit(self._final(message, message['text']))
-        self.emit({'type': 'warning', 'message': '整句复核暂未完成，当前使用实时识别结果。'})
+    def _publish_preview(self):
+        tail = self._tail(self.confirmed or 0, float('inf'))
+        if tail == self.last_preview:
+            return
+        self.last_preview = tail
+        self.revision += 1
+        base = {'id': f'audio:{self.sequence}', 'revision': self.revision}
+        self.emit({'type': 'caption', **base, **tail, 'final': False} if tail else {'type': 'retract', **base})
 
     def _event(self, message):
-        if message.get('type') == 'retract':
-            with self.lock:
-                # A retracted live tail must release its held predecessor.
-                self._flush_held()
-                self.emit(message)
-            return
-        if message.get('type') != 'caption':
-            self.emit(message)
-            return
-        with self.lock:
-            message = dict(message)
-            if self.held:
-                unfinished = weak(self.held['text']) or not re.search(r'[.!?]["”’]*$', self.held['text'])
-                close = message['start'] < self.held['end'] + .1 or (unfinished and message['start'] <= self.held['end'] + 1.5)
-                if close and message['end'] - self.held['start'] <= MAX_MERGE_SECONDS:
-                    message = {**message, 'id': self.held['id'], 'start': self.held['start'],
-                               'text': join_drafts(self.held['text'], message['text'], message['start'] < self.held['end'])}
-                    self.held_live = not message['final']
-                else:
-                    self._flush_held()
-            revision = max(message['revision'], self.revisions.get(message['id'], 0) + 1)
-            self.revisions[message['id']] = revision
-            message['revision'] = revision
-            if not message['final']:
+        with self.condition:
+            if message['type'] == 'retract':
+                self.drafts.pop(message['id'], None)
+            elif message['type'] == 'caption':
+                if message['end'] <= (self.confirmed or 0):
+                    return
+                self.drafts[message['id']] = message
+            else:
                 self.emit(message)
                 return
-            # Moonshine can forcibly split a roughly ten-second region with
-            # overlapping timestamps. Re-recognize the union, not each overlap.
-            duration = message['end'] - message['start']
-            forced = duration >= 9.5 and (not self.held or message['end'] - self.held['end'] >= 9.5)
-            if forced or weak(message['text']) or not re.search(r'[.!?]["”’]*$', message['text']):
-                self.held = message; self.held_live = False
-                self.held_at = self.window.end / self.window.rate
-                self.emit({**message, 'final': False})
-                return
-            self.held = None; self.held_live = False
-            self._submit(message)
+            self._publish_preview()
 
-    def _flush_held(self):
-        message = self.held
-        self.held = None; self.held_live = False
-        if message:
-            self._submit(message)
-
-    def _submit(self, message):
-        with self.lock:
-            if message['id'] in self.pending:
+    def audio(self, packet, rate, behind=False):
+        with self.condition:
+            self.window.append(packet, rate)
+            if self.next_start is None:
+                self.confirmed = self.next_start = packet.offset / rate
+        self.draft.audio(packet, rate, behind)
+        with self.condition:
+            now = self.window.end / rate
+            seconds = len(packet.samples) / rate
+            rms = float(np.sqrt(np.mean(np.square(packet.samples))))
+            self.recent_level = max(rms, self.recent_level * .5 ** (seconds / 1.5))
+            quiet = self.recent_level > .001 and rms < min(.008, self.recent_level * .18)
+            self.quiet_seconds = self.quiet_seconds + seconds if quiet else 0
+            if len(self.pending) >= 2:
                 return
-            # A held final may already have lent its ID to several live tail
-            # previews. If that tail shifts beyond the merge range, flushing
-            # the older held object must supersede those preview revisions.
-            # Otherwise the assembler discards its final as stale and blocks
-            # every following sentence until the user stops capture.
-            revision = max(message['revision'], self.revisions.get(message['id'], 0))
-            message = {**message, 'revision': revision}
-            self.revisions[message['id']] = revision
-            # Keep English readable while the final acoustic pass is pending.
-            self.emit({**message, 'final': False})
-            samples = self.window.slice(message['start'], message['end'])
-            self.tasks = {task for task in self.tasks if not task.done()}
-            if samples is None or message['end'] - message['start'] > 30 or len(self.tasks) >= 2:
-                self._fallback(message)
-                return
-            generation = self.generation
-            callback = self.emit
-            rate = self.window.rate
-            future = self.pool.submit(self._recognize, samples, rate)
-            self.pending[message['id']] = (future, message)
-            self.tasks.add(future)
+            if self.boundary is None and self.quiet_seconds >= .36 and now - self.next_start >= 3.2:
+                self.boundary = now - .16
+            end = min(self.next_start + self.STRIDE, self.boundary or now)
+            if now >= end + self.LOOKAHEAD:
+                self._submit(end)
+                self.boundary = None
 
-            def done(task):
-                with self.lock:
-                    self.tasks.discard(task)
-                    current = self.pending.get(message['id'])
-                    if generation != self.generation or not current or current[0] is not task:
-                        return
-                    self.pending.pop(message['id'])
-                    try:
-                        text, elapsed = task.result()
-                        if not text:
-                            raise ValueError('Empty acoustic second pass')
-                    except Exception:
-                        self.stats['failures'] += 1
-                        self._fallback(message)
-                        self.condition.notify_all()
-                        return
+    def _submit(self, end):
+        start = self.next_start
+        if start is None or end <= start:
+            return
+        rate = self.window.rate
+        origin = max(self.window.frames[0][0] / rate, start - self.HISTORY)
+        samples = self.window.slice(origin, min(self.window.end / rate, end + self.LOOKAHEAD))
+        self.next_start = end
+        speech = [d for d in self.drafts.values() if d['start'] < end and d['end'] > start]
+        submitted = time.perf_counter()
+        def recognize():
+            began = time.perf_counter()
+            if samples is None:
+                raise ValueError('Audio no longer buffered')
+            result = recognize_region(self.refiner, samples, rate, origin, start, end, speech)
+            return result, began - submitted, time.perf_counter() - began
+        future = self.pool.submit(recognize)
+        self.pending[future] = (start, end)
+        def done(task):
+            with self.condition:
+                if self.pending.pop(task, None) is None:
+                    return
+                try:
+                    owned, queued, cost = task.result()
+                    if self.last_word and owned:
+                        w, a, _ = owned[0]
+                        old, _, b = self.last_word
+                        if w.casefold().strip('.,!?') == old.casefold().strip('.,!?') and a < b + .05:
+                            owned.pop(0)
+                    if owned:
+                        self.last_word = owned[-1]
                     self.stats['completed'] += 1
-                    self.stats['maxRefinementMs'] = max(self.stats['maxRefinementMs'], round(elapsed * 1000))
-                    self.stats['inferenceSeconds'] += elapsed
-                    callback(self._final(message, text))
-                    if self.warning:
-                        self.warning = False
-                        callback({'type': 'warning', 'message': ''})
-                    self.condition.notify_all()
-            future.add_done_callback(done)
+                    self.stats['inferenceSeconds'] += cost
+                    self.stats['maxRefinementMs'] = max(self.stats['maxRefinementMs'], round(cost * 1000))
+                    result = {'text': ' '.join(w[0] for w in owned), 'start': owned[0][1], 'end': owned[-1][2],
+                              'wordTimes': owned, 'refineMs': round(cost*1000), 'refineQueueMs': round(queued*1000)} if owned else None
+                except Exception:
+                    self.stats['failures'] += 1
+                    result = self._fallback(start, end)
+                self._commit(end, result)
+                self.condition.notify_all()
+        future.add_done_callback(done)
 
-    def _recognize(self, samples, rate):
-        started = time.perf_counter()
-        return self.refiner.transcribe(samples, rate), time.perf_counter() - started
+    def _fallback(self, start, end):
+        self.stats['fallbacks'] += 1
+        self.emit({'type': 'warning', 'message': '这段原音复核失败，保留实时识别结果。'})
+        return self._tail(start, end)
+
+    def _commit(self, end, result):
+        base = {'id': f'audio:{self.sequence}', 'revision': self.revision + 1}
+        if result:
+            self.emit({'type': 'caption', **base, **result, 'final': True})
+        elif self.last_preview:
+            self.emit({'type': 'retract', **base})
+        self.sequence += 1
+        self.revision = 0
+        self.confirmed = end
+        self.last_preview = None
+        self.drafts = {k: d for k, d in self.drafts.items() if d['end'] > end}
+        self._publish_preview()
 
     def pause(self):
         self.draft.pause()
-        with self.lock:
-            self._flush_held()
-        deadline = time.monotonic() + FINISH_TIMEOUT
         with self.condition:
-            while self.pending and time.monotonic() < deadline:
-                self.condition.wait(timeout=max(0, deadline - time.monotonic()))
-            # Bound stop/pause latency. Late second-pass results cannot overwrite
-            # already displayed translations or cross into a new session.
-            for future, message in list(self.pending.values()):
-                self.pending.pop(message['id'], None)
+            if self.window.frames:
+                self._submit(self.window.end / self.window.rate)
+            self.condition.wait_for(lambda: not self.pending, timeout=FINISH_TIMEOUT)
+            for future, (start, end) in list(self.pending.items()):
+                self.pending.pop(future)
                 future.cancel()
-                self._fallback(message)
-        self.window.clear()
+                self._commit(end, self._fallback(start, end))
+            self.window.clear()
+            self.drafts.clear()
+            self.last_preview = self.next_start = self.confirmed = self.last_word = self.boundary = None
+            self.quiet_seconds = self.recent_level = 0
 
     def finish(self):
         self.pause()
         self.draft.finish()
-        with self.lock:
-            self.generation += 1
-            self.emit = lambda _: None
 
     def metrics(self):
-        with self.lock:
-            return {**self.stats, 'pending': len(self.pending), 'inferenceSeconds': round(self.stats['inferenceSeconds'], 3),
-                    'refiner': getattr(self.refiner, 'name', None)}
+        with self.condition:
+            return {**self.stats, 'pending': len(self.pending), 'refiner': getattr(self.refiner, 'name', 'parakeet')}
 
     def close(self):
-        self.finish(); self.draft.close()
+        self.finish()
+        self.draft.close()
         self.pool.shutdown(wait=True, cancel_futures=True)
 
 

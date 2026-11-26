@@ -39,7 +39,7 @@ winget install --id OpenJS.NodeJS.LTS -e
    powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
    ```
 
-脚本会安装依赖、下载模型并构建 Chrome 扩展，所有内容都放在这个文件夹里。网络中断时，重新运行同一条命令即可，已下载的部分会接着用。
+脚本会在项目目录安装依赖、下载模型、构建 Chrome 扩展，并在桌面生成一对带插件图标的 EXE。网络中断时，重新运行同一条命令即可，已下载的部分会接着用。
 
 ### 4. 把扩展加载到 Chrome
 
@@ -49,10 +49,10 @@ winget install --id OpenJS.NodeJS.LTS -e
 
 ## 日常使用
 
-1. 双击 **Start-NimDaydu.cmd**。看到 “NimDaydu is ready” 就可以了。第一次启动要准备显卡，可能需要半分钟左右。
+1. 双击桌面的 **NimDaydu 启动.exe**（绿色播放图标）。看到“字幕服务已就绪”就可以打开侧栏，提示窗口会自动关闭。
 2. 打开有英文声音的网页，点工具栏里的 NimDaydu 图标，或按 **Alt + Shift + N**，然后在侧栏点 **开始**。
 3. 网页全屏时，悬浮字幕会自动出现。随时按 **Alt + Shift + O** 可以显示或隐藏它。
-4. 用完先在侧栏点 **结束**。不用时双击 **Stop-NimDaydu.cmd** 释放内存。
+4. 用完先在侧栏点 **结束**，等最后一句中文出来。再双击桌面的 **NimDaydu 关闭.exe**（红色叉号），看到“字幕服务已关闭”即可。
 
 <table><tr>
 <td width="36%" valign="top"><img src="images/sidepanel.png" alt="侧栏：每个英文短句上方是它的中文，最下面是正在说的英文"></td>
@@ -62,22 +62,28 @@ winget install --id OpenJS.NodeJS.LTS -e
 <td align="center"><sub>悬浮字幕，拖动可以移动，拖顶部横条调高度</sub></td>
 </tr></table>
 
-可以把两个 `.cmd` 文件发送到桌面快捷方式。关闭 Chrome 不会自动关闭本机服务。
+关闭 Chrome 后，本机服务会继续运行。项目文件夹里的 `Start-NimDaydu.cmd` 和 `Stop-NimDaydu.cmd` 也可双击使用。
+
+如果已有旧版安装、移动了项目文件夹或删掉了桌面入口，在当前项目文件夹运行下面一行即可重建两个按钮，无需重装模型。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-DesktopLaunchers.ps1
+```
 
 ## 更新到新版本
 
-1. 在侧栏点 **结束**，双击 **Stop-NimDaydu.cmd**。
+1. 在侧栏点 **结束**，双击桌面的 **NimDaydu 关闭.exe**。
 2. 获取新版代码：用 Git 的话运行 `git pull`；用压缩包的话，下载新的 ZIP，覆盖到原来的文件夹。
 3. 重新运行安装脚本：`powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1`。已下载的模型会保留，不会重新下载。
-4. 在 `chrome://extensions` 里点 NimDaydu 的 **重新加载**，然后双击 **Start-NimDaydu.cmd**。
+4. 在 `chrome://extensions` 里点 NimDaydu 的 **重新加载**，然后双击桌面的 **NimDaydu 启动.exe**。
 
 设置和已保存的字幕都会保留。
 
 ## 卸载
 
-1. 双击 **Stop-NimDaydu.cmd**。
+1. 双击桌面的 **NimDaydu 关闭.exe**。
 2. 在 `chrome://extensions` 里移除 NimDaydu。
-3. 删除整个 NimDaydu 文件夹。先把 `OUTPUTS` 里想留下的字幕复制出来。
+3. 先把 `OUTPUTS` 里想留下的字幕复制出来，再删除 NimDaydu 文件夹和桌面的两个 EXE。
 
 ## 常见问题
 

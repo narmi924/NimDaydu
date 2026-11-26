@@ -18,6 +18,21 @@ def engine(emit):
     return result
 
 
+def test_drafts_never_request_historical_pcm(monkeypatch, tmp_path):
+    import json
+    from moonshine_voice import ModelArch
+    from unittest.mock import Mock
+    (tmp_path / 'models').mkdir()
+    (tmp_path / 'models/manifest.json').write_text(json.dumps({'small': {'path': 'small', 'arch': next(iter(ModelArch)).value}}))
+    construct = Mock()
+    monkeypatch.setattr('nimdaydu.engine.ROOT', tmp_path)
+    monkeypatch.setattr('moonshine_voice.Transcriber', construct)
+    MoonshineEngine('small')
+    assert construct.call_args.kwargs['options'] == {'return_audio_data': 'false'}
+    MoonshineEngine('small', max_segment_seconds=6)
+    assert construct.call_args.kwargs['options'] == {'return_audio_data': 'false', 'vad_max_segment_duration': 6}
+
+
 def test_empty_acoustic_final_retracts_draft_and_releases_following_good_sentences():
     now = [0.0]; events = []
     assembler = SentenceAssembler(events.append, clock=lambda: now[0])

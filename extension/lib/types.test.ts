@@ -1,7 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { applyTranslation, mergeCaption, mergePreview, readSettings, type Caption, type EnglishPreview } from './types';
+import { subtitleText } from './export';
+import { applyTranslation, draftKey, mergeCaption, mergePreview, readSettings, type Caption, type EnglishPreview } from './types';
 
 const base: Caption = { sessionId: 'session', id: 'line', revision: 1, text: 'Open the form', final: false, start: 0, end: 1 };
+
+it('reuses draft formatting changes while keeping meaningful case and punctuation', () => {
+  expect(draftKey(' Use  C++, ')).toBe(draftKey('Use C++.'));
+  expect(draftKey('Ship now?')).not.toBe(draftKey('Ship now.'));
+  expect(draftKey('Use MB')).not.toBe(draftKey('Use Mb'));
+  expect(draftKey('Install 3.12')).not.toBe(draftKey('Install 3 12'));
+  expect(draftKey('Wait...')).not.toBe(draftKey('Wait.'));
+  expect(draftKey('constructor') in {}).toBe(false);
+});
 
 it('enables saving for existing settings while preserving an explicit opt-out', () => {
   expect(readSettings({ schema: 2, translationMode: 'local' })).toMatchObject({ autoSave: true, translationMode: 'offline' });
@@ -44,4 +54,14 @@ it('rejects old previews after a sentence is committed and ignores another sessi
   expect(mergePreview(cleared, live, 'session')).toBe(cleared);
   expect(mergePreview(cleared, { ...live, sessionId: 'previous', revision: 100 }, 'session')).toBe(cleared);
   expect(mergePreview(undefined, live, 'new-session')).toBeUndefined();
+});
+
+
+it('retains both ends of a long session for bilingual subtitle export', () => {
+  const earlier = Array.from({ length: 5000 }, (_, i) => ({ ...base, id: String(i), final: true }));
+  const all = mergeCaption(earlier, { ...base, id: '5000', text: 'Last.', final: true, start: 3600, end: 3601.5,
+    translation: '最后。', translationRevision: 1 });
+  const srt = subtitleText(all, 'srt');
+  expect(all[0]?.id).toBe('0');
+  expect(srt).toContain('5001\n01:00:00,000 --> 01:00:01,500\nLast.\n最后。');
 });

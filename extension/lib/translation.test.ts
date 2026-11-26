@@ -65,6 +65,21 @@ it('keeps later sentences after a transient failure and repairs the failed sente
   expect(deliver).toHaveBeenCalledTimes(3);
 });
 
+it('replaces a failed translation when the English is corrected and ignores older revisions', async () => {
+  vi.useFakeTimers();
+  const original = caption('a'), corrected = { ...original, revision: original.revision + 1, text: 'NimDaydu.' };
+  const deliver = vi.fn();
+  const queue = new TranslationQueue(async c => {
+    if (c.revision === original.revision) throw new Error('unavailable');
+    return 'NimDaydu';
+  }, deliver, vi.fn(), { retryDelays: [] });
+  queue.enqueue(original); await vi.runAllTimersAsync();
+  expect(queue.status.failed).toBe(1);
+  queue.enqueue(corrected); queue.enqueue(original); await vi.runAllTimersAsync();
+  expect(queue.status.pending).toBe(0);
+  expect(deliver.mock.calls.map(([c]) => c.revision)).toEqual([corrected.revision]);
+});
+
 it('bounds automatic retries, retains failed work, and repairs without retranslating successful Chinese', async () => {
   vi.useFakeTimers();
   let unavailable = true;

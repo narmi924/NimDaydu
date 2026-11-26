@@ -36,6 +36,9 @@ export default defineBackground(() => {
     if (settings.autoSave !== previous.autoSave) {
       void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', autoSave: settings.autoSave }).catch(() => {});
     }
+    if (settings.idleReminder !== previous.idleReminder) {
+      void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', idleReminder: settings.idleReminder }).catch(() => {});
+    }
     if (settings.translationMode !== previous.translationMode) {
       void browser.runtime.sendMessage({ target: 'offscreen', type: 'settings', translationMode: settings.translationMode }).catch(() => {});
     }
@@ -74,7 +77,7 @@ export default defineBackground(() => {
     if (await browser.offscreen.hasDocument()) return;
     if (!creating) {
       creating = browser.offscreen.createDocument({
-        url: 'offscreen.html', reasons: ['USER_MEDIA'],
+        url: 'offscreen.html', reasons: ['USER_MEDIA', 'DISPLAY_MEDIA'],
         justification: 'Capture selected tab audio, preserve playback, and send PCM to the local speech service.',
       }).finally(() => { creating = undefined; });
     }
@@ -97,15 +100,27 @@ export default defineBackground(() => {
         source ??= (await browser.storage.session.get('source')).source as Source | undefined;
         return { source };
       }
+      if (message.type === 'openFloating') {
+        await ensureOffscreen();
+        await offscreenSnapshot();
+        return { ok: true };
+      }
       if (message.type === 'snapshot') {
         if (!(await browser.offscreen.hasDocument())) return { state: { phase: 'idle' }, captions: [] };
         return offscreenSnapshot();
       }
-      if (message.type === 'start') {
+      if (message.type === 'start' || message.type === 'startDesktop') {
         if (starting) throw new Error('字幕正在启动，请稍候。');
         starting = true;
         try {
           source ??= (await browser.storage.session.get('source')).source as Source | undefined;
+          if (message.type === 'startDesktop') {
+            await ensureOffscreen();
+            const current = await offscreenSnapshot();
+            if (['starting', 'capturing', 'paused', 'stopping'].includes(current.state.phase)) throw new Error('请先结束当前转录。');
+            const settings = readSettings((await browser.storage.local.get('settings')).settings as Partial<Settings>);
+            return browser.runtime.sendMessage({ target: 'offscreen', type: 'start', desktop: true, source: { tabId: -1, windowId: -1, title: '桌面音频', site: 'Desktop' }, token: message.token, sentenceHold: settings.sentenceHold, autoSave: settings.autoSave, idleReminder: settings.idleReminder, translationMode: settings.translationMode });
+          }
           if (!source) throw new Error('请在声音所在网页点击 NimDaydu 图标。');
           const tab = await browser.tabs.get(source.tabId).catch(() => { throw new Error('来源标签页已关闭，请在声音所在网页重新点击插件图标。'); });
           if (!tab.url || !/^https?:/.test(tab.url)) throw new Error('请在会议、直播或视频网页中开始。');
@@ -115,7 +130,7 @@ export default defineBackground(() => {
           if (['starting', 'capturing', 'paused', 'stopping'].includes(snapshot.state.phase)) throw new Error('已有字幕会话，请先停止。');
           const streamId = await browser.tabCapture.getMediaStreamId({ targetTabId: source.tabId });
           const settings = readSettings((await browser.storage.local.get('settings')).settings as Partial<Settings> | undefined);
-          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, sentenceHold: message.sentenceHold, autoSave: settings.autoSave, translationMode: settings.translationMode });
+          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, sentenceHold: message.sentenceHold, autoSave: settings.autoSave, idleReminder: settings.idleReminder, translationMode: settings.translationMode });
           if (result?.error) throw new Error(result.error);
           if (!result?.ok) throw new Error('采音页面没有确认启动，请重新打开侧栏后重试。');
           // The page shows it according to the floating-caption setting.

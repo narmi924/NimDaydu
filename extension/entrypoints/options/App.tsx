@@ -81,7 +81,7 @@ export default function App() {
 
     <section className="settings-section" aria-labelledby="speech-heading">
       <h2 id="speech-heading">语音识别</h2>
-      <div className="setting-row"><div><label htmlFor="asr">识别方式</label><p>先显示实时英文，句子说完后再用更准的模型重新识别一遍。结束当前字幕后才能切换。</p></div><select id="asr" value={connection?.model ?? ''} disabled={changingModel || !connection} onChange={event => void changeModel(event.target.value)}>{!connection && <option value="">未连接</option>}<option value="hybrid">实时 + 整句复核（推荐）</option><option value="small">只用实时识别（更省电）</option><option value="medium">只用实时识别 · 较大模型</option></select></div>
+      <div className="setting-row"><div><label htmlFor="asr">识别方式</label><p>先显示实时英文，再由第二个模型连续复核原音。结束当前字幕后才能切换。</p></div><select id="asr" value={connection?.model ?? ''} disabled={changingModel || !connection} onChange={event => void changeModel(event.target.value)}>{!connection && <option value="">未连接</option>}<option value="hybrid">实时 + 原音复核（推荐）</option><option value="small">只用实时识别（更省电）</option><option value="medium">只用实时识别 · 较大模型</option></select></div>
     </section>
 
     <section className="settings-section" aria-labelledby="saving-heading">
@@ -90,10 +90,15 @@ export default function App() {
       <p className="section-note output-path">保存位置：{connection?.outputDirectory || '项目文件夹中的 OUTPUTS'}<br/>每次字幕保存为一个文件夹，包含 TXT 和 JSON。</p>
     </section>
 
+    <section className="settings-section" aria-label="悬浮与聆听">
+      <h2>悬浮与聆听</h2>
+      {([['overlayClickThrough', '鼠标穿过网页字幕'], ['overlayHideQuiet', '安静十秒后收起网页字幕'], ['idleReminder', '十分钟无新字幕后提醒，一分钟后自动结束']] as const).map(([key, label]) =>
+        <label className="setting-row" key={key}>{label}<input type="checkbox" checked={settings[key]} onChange={e => void save({ [key]: e.target.checked })}/></label>)}
+    </section>
     <section className="settings-section" aria-labelledby="connection-heading">
       <h2 id="connection-heading">本机服务</h2>
       <div className="setting-row"><div><p className="connection-label"><span className={`status-dot ${connection ? 'capturing' : 'error'}`}/>{connection ? '已连接' : checking ? '连接中…' : '未连接'}</p><p>{connection ? '识别和翻译都在这台电脑上运行。' : `请先运行项目里的 ${START_SCRIPT}，扩展会自动连接。`}</p></div><button className="button" disabled={checking} onClick={() => void connect()}>重新连接</button></div>
-      {connection && <dl className="diagnostics"><div><dt>翻译模型</dt><dd>{connection.offlineTranslationReady ? connection.translationEngine || '已就绪' : '未就绪'}</dd></div><div><dt>音频来源</dt><dd>开始字幕的那个 Chrome 标签页，不使用麦克风</dd></div></dl>}
+      {connection && <dl className="diagnostics"><div><dt>翻译模型</dt><dd>{connection.offlineTranslationReady ? connection.translationEngine || '已就绪' : connection.translationState === 'loading' ? '正在加载' : connection.translationState === 'idle' ? '按需加载' : '未就绪'}</dd></div><div><dt>音频来源</dt><dd>所选标签页，或主动共享声音的桌面来源</dd></div></dl>}
     </section>
     <footer className="settings-footer"><button className="text-button" onClick={() => void save({ ...DEFAULT_SETTINGS, token: settingsRef.current.token })}>恢复默认设置</button><span role="status">{saved}</span></footer>
   </main>;

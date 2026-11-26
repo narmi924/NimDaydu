@@ -1,5 +1,5 @@
 #!/bin/bash
-# NimDaydu setup for macOS on Apple Silicon. Usage: bash setup.sh [hybrid|small|medium]
+# NimDaydu setup for Apple Silicon macOS and x86-64 Linux. Usage: bash setup.sh [hybrid|small|medium]
 # Everything is installed inside this project folder; no sudo or Homebrew needed.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -12,10 +12,16 @@ NODE_SHA256=89c682593d76cd44233fa53b1563264e7de9cbb189cad169135c5b4fadfbc0a7
 
 fail() { echo "安装失败：$*" >&2; exit 1; }
 
-[ "$(uname -s)" = Darwin ] || fail '这个脚本只用于 macOS；Windows 请运行 setup.ps1。'
-[ "$(uname -m)" = arm64 ] || fail '需要 Apple 芯片（M1 及以后）的 Mac。'
-macos_major="$(sw_vers -productVersion | cut -d. -f1)"
-[ "$macos_major" -ge 15 ] || fail '需要 macOS 15 或更新版本。'
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)
+    [ "$(sw_vers -productVersion | cut -d. -f1)" -ge 15 ] || fail '需要 macOS 15 或更新版本。'
+    uv_target=aarch64-apple-darwin; node_target=darwin-arm64 ;;
+  Linux-x86_64)
+    uv_target=x86_64-unknown-linux-gnu; node_target=linux-x64
+    UV_SHA256=0c6bab77a67a445dc849ed5e8ee8d3cb333b6e2eba863643ce1e228075f27943
+    NODE_SHA256=eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c ;;
+  *) fail '支持 Apple 芯片 macOS 或 x86-64 Linux；Windows 请使用 setup.ps1。' ;;
+esac
 case "$MODEL" in ''|hybrid|small|medium) ;; *) fail '识别方式只能是 hybrid、small 或 medium。' ;; esac
 
 TOOLS="$PROJECT/.tools"
@@ -32,18 +38,18 @@ fetch() {
   [ "$(shasum -a 256 "$target" | cut -d' ' -f1)" = "$sha" ] || { rm -f "$target"; fail "$(basename "$target") 校验失败，请重新运行。"; }
 }
 
-UV="$TOOLS/uv-$UV_VERSION/uv"
+UV="$TOOLS/uv-$UV_VERSION-$uv_target/uv"
 if [ ! -x "$UV" ]; then
-  archive="$TOOLS/downloads/uv-aarch64-apple-darwin-$UV_VERSION.tar.gz"
-  fetch "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-aarch64-apple-darwin.tar.gz" "$archive" "$UV_SHA256"
-  mkdir -p "$TOOLS/uv-$UV_VERSION"
-  tar -xzf "$archive" -C "$TOOLS/uv-$UV_VERSION" --strip-components 1
+  archive="$TOOLS/downloads/uv-$uv_target-$UV_VERSION.tar.gz"
+  fetch "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-$uv_target.tar.gz" "$archive" "$UV_SHA256"
+  mkdir -p "$(dirname "$UV")"
+  tar -xzf "$archive" -C "$(dirname "$UV")" --strip-components 1
 fi
 
-NODE_HOME="$TOOLS/node-v$NODE_VERSION-darwin-arm64"
+NODE_HOME="$TOOLS/node-v$NODE_VERSION-$node_target"
 if [ ! -x "$NODE_HOME/bin/node" ]; then
-  archive="$TOOLS/downloads/node-v$NODE_VERSION-darwin-arm64.tar.gz"
-  fetch "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-darwin-arm64.tar.gz" "$archive" "$NODE_SHA256"
+  archive="$TOOLS/downloads/node-v$NODE_VERSION-$node_target.tar.gz"
+  fetch "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-$node_target.tar.gz" "$archive" "$NODE_SHA256"
   tar -xzf "$archive" -C "$TOOLS"
 fi
 export PATH="$NODE_HOME/bin:$PATH"
@@ -74,5 +80,5 @@ fi
 chmod +x "$PROJECT/start.sh" "$PROJECT/stop.sh" "$PROJECT/Start-NimDaydu.command" "$PROJECT/Stop-NimDaydu.command" 2>/dev/null || true
 echo
 echo '安装完成。'
-echo '1. 双击 Start-NimDaydu.command 启动本机服务。'
+echo '1. 运行 ./start.sh 启动本机服务。'
 echo "2. 在 Chrome 打开 chrome://extensions，开启开发者模式，加载 $PROJECT/extension/.output/chrome-mv3"

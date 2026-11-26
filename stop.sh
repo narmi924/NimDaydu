@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop the NimDaydu local service on macOS, releasing model memory.
+# Stop the NimDaydu local service on macOS and Linux, releasing model memory.
 set -euo pipefail
 cd "$(dirname "$0")"
 RECORD="$PWD/.nimdaydu/process.json"

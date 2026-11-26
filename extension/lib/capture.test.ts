@@ -1,4 +1,6 @@
+import pcmSource from '../public/audio-worklet.js?raw';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { draftKey } from './types';
 
 const runtime = vi.hoisted(() => ({ listener: undefined as any, connect: undefined as any, sendMessage: vi.fn() }));
 vi.mock('wxt/browser', () => ({ browser: { runtime: {
@@ -125,7 +127,7 @@ it('cleans up a fatal peer error immediately and preserves settled bilingual cap
 
 it.each([3, 9])('allows a transient send burst but bounds a persistent transport backlog (%s seconds)', async seconds => {
   await start();
-  sockets[0]!.bufferedAmount = 48000 * 4 * seconds;
+  sockets[0]!.bufferedAmount = sockets[0]!.sent[0].sampleRate * 4 * seconds;
   worklets[0].port.onmessage({ data: { samples: new Float32Array(3840).buffer, offset: 0 } });
   for (let index = 0; index < 10; index++) await Promise.resolve();
   const snapshot = await command('snapshot');
@@ -204,16 +206,68 @@ it('translates finished live rows early and reuses them when the caption settles
   sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 2, text: 'Check availability. Then we pay.',
     units: ['Check availability.', 'Then we pay.'], start: 0, end: 3 });
   await vi.advanceTimersByTimeAsync(10);
-  // A last row that already ends the sentence is drafted too.
+  // A period on the still-changing last row must survive another acoustic update.
+  expect(requests).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1100);
   expect(requests.map(request => request.text)).toEqual(['Check availability.', 'Then we pay.']);
-  requests.length = 1;
   expect(runtime.sendMessage.mock.calls.some(([message]) => message.type === 'draft' && message.text === '检查可用性。')).toBe(true);
-  expect((await command('snapshot')).drafts).toEqual({ 'check availability': '检查可用性。', 'then we pay': '其他。' });
-  // The settled caption differs only in case and punctuation: no second model call.
+  expect((await command('snapshot')).drafts).toEqual({ [draftKey('Check availability.')]: '检查可用性。', [draftKey('Then we pay.')]: '其他。' });
+  // Dropping the final period doesn't need another model call.
   sockets[0]!.emit(settled('sentence:1', 'Check availability', 0));
   await vi.advanceTimersByTimeAsync(10);
-  expect(requests).toHaveLength(1);
+  expect(requests).toHaveLength(2);
   expect((await command('snapshot')).captions[0].translation).toBe('检查可用性。');
+});
+
+it('translates the final programming language even when a similar name was drafted', async () => {
+  const requested: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    if (!String(url).endsWith('/translate')) return new Response('{}');
+    const { text } = JSON.parse(String(init?.body));
+    requested.push(text);
+    return Response.json({ text: text.replace('We use', '我们用') });
+  });
+  await command('start', { source: { tabId: 1, windowId: 1, title: 'Meeting' }, streamId: 'stream', token: 'test-token',
+    sentenceHold: .4, autoSave: false, translationMode: 'offline' });
+  sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'We use C++.', start: 0, end: 2, speechEnded: true });
+  await vi.advanceTimersByTimeAsync(10);
+  sockets[0]!.emit(settled('sentence:1', 'We use C#.', 0));
+  sockets[0]!.emit(settled('sentence:2', 'We use C.', 2));
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual(['We use C++.', 'We use C#.', 'We use C.']);
+  expect((await command('snapshot')).captions.map((c: { translation: string }) => c.translation))
+    .toEqual(['我们用 C#。', '我们用 C。']);
+});
+
+it('waits for a stable clause, then translates an unpunctuated ending before refinement', async () => {
+  const requested: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    if (!String(url).endsWith('/translate')) return new Response('{}');
+    requested.push(JSON.parse(String(init?.body)).text);
+    return Response.json({ text: '会议字幕', modelMs: 15, queueMs: 3 });
+  });
+  await command('start', { source: { tabId: 1, windowId: 1, title: 'Meeting' }, streamId: 'stream',
+    token: 'test-token', autoSave: false, sentenceHold: .4, translationMode: 'offline' });
+  worklets[0].port.onmessage({ data: { samples: new Float32Array(3840).buffer, offset: 0 } });
+  const clause = 'We changed the price of the remote today,';
+  const preview = (revision: number, tail: string, speechEnded = false) => sockets[0]!.emit({
+    type: 'preview', sessionId: 'session-1', revision, start: 0, end: revision,
+    text: clause + ' ' + tail, units: [clause, tail], speechEnded,
+  });
+  preview(1, 'because the');
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual([]);
+  preview(2, 'because the batteries');
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual([clause]);
+  preview(3, 'because the batteries cost more', true);
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual([clause, 'because the batteries cost more']);
+  sockets[0]!.emit(settled('sentence:1', 'because the batteries cost more.', 0));
+  await vi.advanceTimersByTimeAsync(10);
+  const timing = (await command('diagnostics')).events.find((event: { code: string }) => event.code === 'caption_timing');
+  expect(timing).toMatchObject({ sentence: 1, modelMs: 0, firstChineseMs: expect.any(Number), finalChineseMs: expect.any(Number) });
+  expect(requested).toHaveLength(2);
 });
 
 it('does not translate when translation is disabled', async () => {
@@ -223,4 +277,63 @@ it('does not translate when translation is disabled', async () => {
     units: ['Check availability.', 'Then we'], start: 0, end: 2 });
   await vi.advanceTimersByTimeAsync(10);
   expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/translate'))).toHaveLength(0);
+});
+
+
+it('resamples device audio without clock drift or folding ultrasonic tones into speech', () => {
+  function capture(rate: number, frequency: number) {
+    const frames: Array<{ samples: ArrayBuffer; offset: number }> = [];
+    class Processor { port = { postMessage: (packet: typeof frames[number]) => frames.push(packet) }; }
+    type Worklet = { process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean };
+    let node: Worklet;
+    Function('AudioWorkletProcessor', 'sampleRate', 'registerProcessor', pcmSource)(Processor, rate,
+      (_name: string, WorkletClass: new () => Worklet) => { node = new WorkletClass(); });
+    for (let i = 0; i < rate * .4; i += 128) {
+      const size = Math.min(128, rate * .4 - i);
+      const signal = Float32Array.from({ length: size }, (_, j) => Math.sin(2 * Math.PI * frequency * (i + j) / rate));
+      node!.process([[signal]], [[new Float32Array(size)]]);
+    }
+    expect(frames.map(f => f.offset)).toEqual([0, 1280, 2560, 3840, 5120]);
+    const pcm = new Float32Array(frames[1]!.samples);
+    return Math.sqrt(pcm.reduce((sum, x) => sum + x * x, 0) / pcm.length);
+  }
+  for (const rate of [44100, 48000, 96000]) {
+    expect(capture(rate, 1000)).toBeGreaterThan(.68);
+    expect(capture(rate, 14000)).toBeLessThan(.015);
+  }
+});
+
+it('keeps only the shared audio and rejects a source with no audio before starting recognition', async () => {
+  const video = { stop: vi.fn() };
+  let audioTracks: typeof track[] = [];
+  const shared = { getVideoTracks: () => [video], getAudioTracks: () => audioTracks,
+    getTracks: () => audioTracks, removeTrack: vi.fn() };
+  const getDisplayMedia = vi.fn().mockResolvedValue(shared);
+  vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia } });
+  const fields = { desktop: true, source: { tabId: -1, windowId: -1, title: 'Desktop' }, token: 'test-token', autoSave: false };
+  expect((await command('start', fields)).error).toContain('没有共享声音');
+  expect(sockets).toHaveLength(0);
+  expect(video.stop).toHaveBeenCalledOnce();
+  audioTracks = [track];
+  expect(await command('start', fields)).toMatchObject({ ok: true });
+  expect(shared.removeTrack).toHaveBeenCalledWith(video);
+  expect(sockets[0]?.sent.find(packet => packet.type === 'hello')?.sampleRate).toBe(16000);
+});
+
+it('shares the silence countdown across views and cancels it on speech or a request to keep listening', async () => {
+  await start(false);
+  runtime.connect({ name: 'nimdaydu-overlay', sender: { id: 'nimdaydu-test' }, postMessage() {},
+    onDisconnect: { addListener() {} } });
+  await vi.advanceTimersByTimeAsync(660_000);
+  expect((await command('snapshot')).state.phase).toBe('capturing');
+  await command('settings', { idleReminder: true });
+  await vi.advanceTimersByTimeAsync(600_000);
+  expect((await command('snapshot')).state.idleStopAt).toBe(Date.now() + 60_000);
+  await command('continueListening');
+  expect((await command('snapshot')).state.idleStopAt).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(600_000);
+  sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'Hello again', start: 0, end: 1 });
+  expect((await command('snapshot')).state.idleStopAt).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(666_000);
+  expect((await command('snapshot')).state.phase).toBe('stopped');
 });
