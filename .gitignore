@@ -15,6 +15,7 @@ samples/*.wav
 samples/*.mp3
 artifacts/
 /tmp/
+!samples/english.wav
 OUTPUTS/
 *.log
 

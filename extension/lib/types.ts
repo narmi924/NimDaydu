@@ -7,7 +7,7 @@ export type Caption = {
   id: string; sessionId: string; revision: number; text: string; final: boolean;
   start: number; end: number; inferenceMs?: number;
   translation?: string; translationRevision?: number;
-  paragraph?: number; incomplete?: boolean; rawText?: string[];
+  paragraph?: number; incomplete?: boolean; rawText?: string[]; recognizedText?: string;
   /** A clause of a longer sentence; the sentence continues in the next caption. */
   continued?: boolean;
 };
@@ -24,8 +24,8 @@ export type EnglishPreview = { sessionId: string; revision: number; text: string
 export type Snapshot = { state: CaptureState; captions: Caption[]; preview?: EnglishPreview };
 /** Floating captions on the page: only while it is fullscreen, always, or never. */
 export type OverlayMode = 'fullscreen' | 'always' | 'off';
-export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number; autoSave: boolean; overlay: OverlayMode };
-export const DEFAULT_SETTINGS: Settings = { schema: 3, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.4, autoSave: true, overlay: 'fullscreen' };
+export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number; autoSave: boolean; overlayClickThrough: boolean; overlayHideQuiet: boolean; idleReminder: boolean; overlay: OverlayMode };
+export const DEFAULT_SETTINGS: Settings = { schema: 3, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.4, autoSave: true, overlayClickThrough: false, overlayHideQuiet: false, idleReminder: false, overlay: 'fullscreen' };
 export function readSettings(saved?: Partial<Omit<Settings, 'translationMode'>> & { translationMode?: string }): Settings {
   const translationMode = saved?.translationMode === 'off' ? 'off' : 'offline';
   if (saved?.schema === 3) return { ...DEFAULT_SETTINGS, ...saved, translationMode };
@@ -38,11 +38,11 @@ export const isActive = (phase: Phase) => ['starting', 'capturing', 'paused', 's
 
 export function mergeCaption(captions: Caption[], incoming: Caption): Caption[] {
   const index = captions.findIndex(c => c.id === incoming.id && c.sessionId === incoming.sessionId);
-  if (index < 0) return [...captions.slice(-4999), incoming];
+  if (index < 0) return [...captions, incoming];
   const current = captions[index]!;
   if (incoming.revision <= current.revision) return captions;
   const updated = captions.slice();
-  updated[index] = { ...current, ...incoming };
+  updated[index] = { ...current, translation: undefined, translationRevision: undefined, ...incoming };
   return updated;
 }
 

@@ -14,6 +14,18 @@ def caption(index=1, text='The complete spoken sentence.'):
 
 
 @pytest.mark.asyncio
+async def test_history_search_finds_original_misspellings_in_older_recordings(tmp_path):
+    store = OutputStore(tmp_path)
+    key = str(uuid4())
+    store.begin(key)
+    store.caption(key, caption(text='Please open Nim Dadu.'))
+    await store.flush(key)
+    record, = store.find_records('NimDaydu', {'nim dadu': 'NimDaydu'})
+    assert record['sessionId'] == key
+    assert record['searchTerms'] == ['nim dadu', 'nimdaydu']
+
+
+@pytest.mark.asyncio
 async def test_periodic_flush_saves_english_then_late_chinese_without_replacing_good_translation(tmp_path):
     store = OutputStore(tmp_path / 'OUTPUTS'); key = str(uuid4())
     store.begin(key, source={'title': 'Meeting / ../ title', 'site': 'YouTube', 'host': 'youtube.com', 'token': 'must-never-save'})

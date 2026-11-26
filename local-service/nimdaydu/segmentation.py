@@ -79,6 +79,24 @@ def display_units(text):
     return [unit for sentence in split_sentences(text) if sentence.strip() for unit in split_units(sentence.strip())]
 
 
+def timed_parts(parts, start, end, spans):
+    """Use token timings when they cover the displayed words exactly."""
+    if spans and words(' '.join(s[0] for s in spans)) == words(' '.join(parts)) and all(words(p) for p in parts):
+        timed = [(s[1], s[2]) for s in spans for _ in words(s[0])]
+        index = 0
+        for part in parts:
+            count = len(words(part))
+            yield timed[index][0], timed[index + count - 1][1]
+            index += count
+        return
+    total = sum(map(len, parts))
+    offset = 0
+    for part in parts:
+        left = start + (end - start) * offset / total
+        offset += len(part)
+        yield left, start + (end - start) * offset / total
+
+
 def continuation(previous, current):
     if weak(previous) or date_continuation(previous, current):
         return True
@@ -168,15 +186,12 @@ class SentenceAssembler:
             self.finalized.add(identifier)
             pieces = split_sentences(normalized['text'])
             if len(pieces) > 1:
-                duration = max(0, normalized['end'] - normalized['start'])
-                total = sum(len(piece) for piece in pieces)
-                offset = 0
                 replacements = []
-                for index, piece in enumerate(pieces):
+                spans = normalized.get('wordTimes', [])
+                bounds = timed_parts(pieces, normalized['start'], normalized['end'], spans)
+                for index, (piece, (start, end)) in enumerate(zip(pieces, bounds)):
                     replacements.append((f'{identifier}/part:{index}', {**normalized, 'id': f'{identifier}/part:{index}', 'text': piece,
-                        'start': normalized['start'] + duration * offset / total,
-                        'end': normalized['start'] + duration * (offset + len(piece)) / total}))
-                    offset += len(piece)
+                        'start': start, 'end': end, 'wordTimes': [s for s in spans if start <= s[1] and s[2] <= end]}))
                 items = list(self.lines.items())
                 self.lines.clear()
                 placed = False
@@ -208,9 +223,9 @@ class SentenceAssembler:
                 if gap > 1.5 or not continuation(text, next_line['text']):
                     break
                 if not next_line['final']:
-                    # Only a plausible continuation may delay a finalized line.
-                    # It will be re-evaluated on the next model update.
-                    return
+                    if self.clock() - group[-1]['_received'] < max(self.hold, 1.8):
+                        return
+                    break
                 text = join_fragments(text, next_line['text'])
                 group.append(next_line)
             last = group[-1]
@@ -240,17 +255,14 @@ class SentenceAssembler:
             self.committed.add(line['id'])
         units = split_units(text)
         latest = max(group, key=lambda line: line['_received'])
-        total = sum(len(unit) for unit in units)
-        duration = max(0, last['end'] - first['start'])
-        offset = 0
-        for index, unit in enumerate(units):
+        spans = [s for line in group for s in line.get('wordTimes', [])]
+        bounds = timed_parts(units, first['start'], last['end'], spans)
+        for index, (unit, (start, end)) in enumerate(zip(units, bounds)):
             final_unit = index == len(units) - 1
             self.counter += 1
             message = {'type': 'caption', 'id': f'sentence:{self.counter}', 'revision': 1, 'final': True,
                        'text': unit, 'paragraph': self.paragraph,
-                       # Times inside one acoustic span are estimated by text length.
-                       'start': first['start'] + duration * offset / total,
-                       'end': last['end'] if final_unit else first['start'] + duration * (offset + len(unit)) / total,
+                       'start': start, 'end': end,
                        'incomplete': incomplete and final_unit, 'continued': not final_unit,
                        'rawText': [line['text'] for line in group] if index == 0 else [],
                        'inferenceMs': max(line.get('inferenceMs', 0) for line in group)}
@@ -258,7 +270,6 @@ class SentenceAssembler:
             for key in ('refineMs', 'refineQueueMs'):
                 if key in latest:
                     message[key] = latest[key]
-            offset += len(unit)
             if final_unit:
                 message['preview'] = self._preview_snapshot()
             self.emit(message)

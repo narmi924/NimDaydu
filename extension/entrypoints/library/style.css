@@ -1,0 +1,6 @@
+body{max-width:850px;margin:32px auto;padding:0 20px;font:16px/1.55 system-ui}
+h1{font-size:1.55rem}h2{font-size:1.1rem}section{margin:20px 0}
+button,select,input{font:inherit;margin:3px;padding:5px 8px;max-width:100%}
+video{display:block;max-height:300px;max-width:100%;margin-top:12px}
+article{display:flex;align-items:baseline;gap:12px;content-visibility:auto;contain-intrinsic-size:auto 62px}
+article p{margin:4px 0}time{font-variant-numeric:tabular-nums}p:empty{display:none}

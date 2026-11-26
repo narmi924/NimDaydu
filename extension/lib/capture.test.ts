@@ -1,3 +1,4 @@
+import pcmSource from '../public/audio-worklet.js?raw';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { draftKey } from './types';
 
@@ -126,7 +127,7 @@ it('cleans up a fatal peer error immediately and preserves settled bilingual cap
 
 it.each([3, 9])('allows a transient send burst but bounds a persistent transport backlog (%s seconds)', async seconds => {
   await start();
-  sockets[0]!.bufferedAmount = 48000 * 4 * seconds;
+  sockets[0]!.bufferedAmount = sockets[0]!.sent[0].sampleRate * 4 * seconds;
   worklets[0].port.onmessage({ data: { samples: new Float32Array(3840).buffer, offset: 0 } });
   for (let index = 0; index < 10; index++) await Promise.resolve();
   const snapshot = await command('snapshot');
@@ -276,4 +277,45 @@ it('does not translate when translation is disabled', async () => {
     units: ['Check availability.', 'Then we'], start: 0, end: 2 });
   await vi.advanceTimersByTimeAsync(10);
   expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/translate'))).toHaveLength(0);
+});
+
+
+it('resamples device audio without clock drift or folding ultrasonic tones into speech', () => {
+  function capture(rate: number, frequency: number) {
+    const frames: Array<{ samples: ArrayBuffer; offset: number }> = [];
+    class Processor { port = { postMessage: (packet: typeof frames[number]) => frames.push(packet) }; }
+    type Worklet = { process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean };
+    let node: Worklet;
+    Function('AudioWorkletProcessor', 'sampleRate', 'registerProcessor', pcmSource)(Processor, rate,
+      (_name: string, WorkletClass: new () => Worklet) => { node = new WorkletClass(); });
+    for (let i = 0; i < rate * .4; i += 128) {
+      const size = Math.min(128, rate * .4 - i);
+      const signal = Float32Array.from({ length: size }, (_, j) => Math.sin(2 * Math.PI * frequency * (i + j) / rate));
+      node!.process([[signal]], [[new Float32Array(size)]]);
+    }
+    expect(frames.map(f => f.offset)).toEqual([0, 1280, 2560, 3840, 5120]);
+    const pcm = new Float32Array(frames[1]!.samples);
+    return Math.sqrt(pcm.reduce((sum, x) => sum + x * x, 0) / pcm.length);
+  }
+  for (const rate of [44100, 48000, 96000]) {
+    expect(capture(rate, 1000)).toBeGreaterThan(.68);
+    expect(capture(rate, 14000)).toBeLessThan(.015);
+  }
+});
+
+it('keeps only the shared audio and rejects a source with no audio before starting recognition', async () => {
+  const video = { stop: vi.fn() };
+  let audioTracks: typeof track[] = [];
+  const shared = { getVideoTracks: () => [video], getAudioTracks: () => audioTracks,
+    getTracks: () => audioTracks, removeTrack: vi.fn() };
+  const getDisplayMedia = vi.fn().mockResolvedValue(shared);
+  vi.stubGlobal('navigator', { mediaDevices: { getDisplayMedia } });
+  const fields = { desktop: true, source: { tabId: -1, windowId: -1, title: 'Desktop' }, token: 'test-token', autoSave: false };
+  expect((await command('start', fields)).error).toContain('没有共享声音');
+  expect(sockets).toHaveLength(0);
+  expect(video.stop).toHaveBeenCalledOnce();
+  audioTracks = [track];
+  expect(await command('start', fields)).toMatchObject({ ok: true });
+  expect(shared.removeTrack).toHaveBeenCalledWith(video);
+  expect(sockets[0]?.sent.find(packet => packet.type === 'hello')?.sampleRate).toBe(16000);
 });

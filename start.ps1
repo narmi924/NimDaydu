@@ -30,7 +30,7 @@ if ($health) {
         $serverProcess = Get-Process -Id $health.processId
         @{ pid = $serverProcess.Id; startTime = $serverProcess.StartTime.ToUniversalTime().ToString('o'); executable = $serverProcess.Path } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stateDir 'process.json') -Encoding utf8
     }
-    Write-Host "NimDaydu is ready. Speech: $($health.model). Translation: $($health.translationEngine). Audio stays on this computer."
+    Write-Host "NimDaydu is ready. Speech: $($health.model). Hy-MT2 loads on demand. Audio stays on this computer."
 }
 Write-Host 'The Chrome extension connects automatically. No pairing code is needed.'
 if ($OpenPairing) { Start-Process 'http://127.0.0.1:8765/pairing' }

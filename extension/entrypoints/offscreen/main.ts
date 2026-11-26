@@ -166,7 +166,9 @@ function publish(message: Record<string, unknown>) {
 }
 
 function acceptTranslation(message: { sessionId: string; id: string; revision: number; text: string }) {
-  captions = applyTranslation(captions, message);
+  const updated = applyTranslation(captions, message);
+  if (updated === captions) return;
+  captions = updated;
   const translated = captions.find(caption => caption.sessionId === message.sessionId && caption.id === message.id);
   if (translated) outputs.enqueue(translated);
   publish({ type: 'translation', ...message });
@@ -216,8 +218,21 @@ async function stop(message?: string, failed = false) {
   return stopping;
 }
 
-async function start(source: Source, streamId: string, token: string, sentenceHold: number, autoSave: boolean, mode: TranslationMode = DEFAULT_SETTINGS.translationMode) {
+async function start(source: Source, streamId: string, token: string, sentenceHold: number, autoSave: boolean, mode: TranslationMode = DEFAULT_SETTINGS.translationMode, desktop = false) {
   if (isActive(state.phase)) throw new Error('已有会话运行中。');
+  let selected: MediaStream | undefined;
+  if (desktop) {
+    try {
+      selected = await navigator.mediaDevices.getDisplayMedia({
+        audio: true, video: true, systemAudio: 'include', windowAudio: 'window',
+      } as DisplayMediaStreamOptions);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'NotAllowedError') throw new Error('没有开始共享声音。请在 Chrome 的共享窗口中选择音源并允许共享。');
+      throw error;
+    }
+    for (const track of selected.getVideoTracks()) { track.stop(); selected.removeTrack(track); }
+    if (!selected.getAudioTracks().length) throw new Error('所选来源没有共享声音。请选择支持音频的窗口、屏幕或标签页并勾选共享音频。');
+  }
   await cleanup();
   captions = [];
   preview = undefined;
@@ -233,19 +248,19 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
   setState({});
   try {
     const constraints = { audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } }, video: false };
-    media = await navigator.mediaDevices.getUserMedia(constraints as unknown as MediaStreamConstraints);
+    media = selected ?? await navigator.mediaDevices.getUserMedia(constraints as unknown as MediaStreamConstraints);
     media.getAudioTracks()[0]?.addEventListener('ended', () => {
       if (isActive(state.phase) && state.phase !== 'stopping') void stop('声音来源已关闭。');
     });
     context = new AudioContext({ latencyHint: 'interactive' });
     await context.resume();
     const input = context.createMediaStreamSource(media);
-    input.connect(context.destination);
+    if (!desktop) input.connect(context.destination);
     await context.audioWorklet.addModule(browser.runtime.getURL('/audio-worklet.js'));
     worklet = new AudioWorkletNode(context, 'nimdaydu-pcm');
     input.connect(worklet);
     worklet.connect(context.destination);
-    const rate = context.sampleRate;
+    const rate = Math.min(16000, context.sampleRate);
     socket = new WebSocket(SOCKET);
     const currentSocket = socket;
     await new Promise<void>((resolve, reject) => {
@@ -351,6 +366,25 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
   if (message?.target !== 'offscreen' || sender.id !== browser.runtime.id) return;
   (async () => {
     if (message.type === 'snapshot') return { state, captions, preview, drafts, translationStatus, serviceTranslation: servesTranslation() };
+    if (message.type === 'editTerm') {
+      const sessionId = state.sessionId;
+      if (!sessionId || message.sessionId !== sessionId) throw new Error('字幕会话已切换。');
+      const response = await fetch(`http://127.0.0.1:8765/terms/${sessionId}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${serviceToken}` },
+        body: JSON.stringify(message.edit),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(typeof result.detail === 'string' ? result.detail : '纠词失败。');
+      if (state.sessionId !== sessionId) return { ok: true };
+      for (const item of result.captions) {
+        const caption = { ...item, sessionId };
+        captions = mergeCaption(captions, caption);
+        publish({ type: 'caption', caption, preview });
+        if (servesTranslation()) serviceQueue.enqueue(caption);
+      }
+      if (!result.saved) setState({ saveError: '字幕已更正，写入输出文件失败。' });
+      return { ok: true };
+    }
     if (message.type === 'diagnostics') return { phase: state.phase, recovering: Boolean(state.recovering), events: diagnosticSnapshot() };
     if (message.type === 'settings') {
       if ('autoSave' in message) {
@@ -364,7 +398,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       lastLease = Date.now();
       return { ok: true };
     }
-    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode);
+    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode, message.desktop === true);
     if (message.type === 'pause' && state.phase === 'capturing') {
       setState({ phase: 'paused' });
       socket?.send(JSON.stringify({ type: 'pause' }));

@@ -18,7 +18,7 @@ MAX_UPDATE_INTERVAL = 5.0
 
 class MoonshineEngine:
     """All native operations are called on the service's single ASR executor."""
-    def __init__(self, model: str):
+    def __init__(self, model: str, max_segment_seconds=None):
         # Hybrid Intel CPUs can spend more time coordinating ORT's default
         # per-session thread pools than executing these small streaming graphs.
         os.environ.setdefault("MOONSHINE_ORT_SINGLE_THREAD", "1")
@@ -31,7 +31,8 @@ class MoonshineEngine:
         if model not in manifest:
             raise RuntimeError(f"Model '{model}' missing. Run {SETUP_SCRIPT} again and choose {model}.")
         # Manifests written on Windows before v0.6 use backslashes.
-        self.transcriber = Transcriber(ROOT / manifest[model]["path"].replace("\\", "/"), ModelArch(manifest[model]["arch"]), update_interval=UPDATE_INTERVAL)
+        self.transcriber = Transcriber(ROOT / manifest[model]["path"].replace("\\", "/"), ModelArch(manifest[model]["arch"]),
+                                       update_interval=UPDATE_INTERVAL, options={"vad_max_segment_duration": max_segment_seconds} if max_segment_seconds else None)
         self.model = model
         self.stream = None
         self.emit: Callable = lambda _: None

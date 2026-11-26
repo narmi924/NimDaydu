@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { subtitleText } from './export';
 import { applyTranslation, draftKey, mergeCaption, mergePreview, readSettings, type Caption, type EnglishPreview } from './types';
 
 const base: Caption = { sessionId: 'session', id: 'line', revision: 1, text: 'Open the form', final: false, start: 0, end: 1 };
@@ -53,4 +54,14 @@ it('rejects old previews after a sentence is committed and ignores another sessi
   expect(mergePreview(cleared, live, 'session')).toBe(cleared);
   expect(mergePreview(cleared, { ...live, sessionId: 'previous', revision: 100 }, 'session')).toBe(cleared);
   expect(mergePreview(undefined, live, 'new-session')).toBeUndefined();
+});
+
+
+it('retains both ends of a long session for bilingual subtitle export', () => {
+  const earlier = Array.from({ length: 5000 }, (_, i) => ({ ...base, id: String(i), final: true }));
+  const all = mergeCaption(earlier, { ...base, id: '5000', text: 'Last.', final: true, start: 3600, end: 3601.5,
+    translation: '最后。', translationRevision: 1 });
+  const srt = subtitleText(all, 'srt');
+  expect(all[0]?.id).toBe('0');
+  expect(srt).toContain('5001\n01:00:00,000 --> 01:00:01,500\nLast.\n最后。');
 });

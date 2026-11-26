@@ -148,8 +148,10 @@ function mountOverlay() {
 
   function render(restack = false) {
     if (!alive) return;
+    box.style.pointerEvents = settings.overlayClickThrough ? 'none' : '';
+    box.inert = settings.overlayClickThrough;
     if (data.state.sessionId !== sessionId) { sessionId = data.state.sessionId; override = undefined; following = true; }
-    if (!overlayVisible(settings.overlay, data.state.phase, Boolean(document.fullscreenElement), override)) { hide(); return; }
+    if ((settings.overlayHideQuiet && data.updatedAt > 0 && Date.now() - data.updatedAt > QUIET_MS && following && !drag && !resize) || !overlayVisible(settings.overlay, data.state.phase, Boolean(document.fullscreenElement), override)) { hide(); return; }
     const mode = settings.translationMode === 'off' ? 'original' : settings.viewMode;
     const rows = overlayRows(data.captions, data.preview, mode, data.drafts);
     renderItems(rows, mode === 'original');
@@ -218,7 +220,7 @@ function mountOverlay() {
   close.addEventListener('click', () => { override = 'hidden'; render(); });
 
   document.addEventListener('fullscreenchange', () => render(true));
-  timer = setInterval(() => { if (alive && opened()) box.classList.toggle('quiet', Date.now() - data.updatedAt > QUIET_MS); }, 1000);
+  timer = setInterval(() => { if (alive && opened()) { box.classList.toggle('quiet', Date.now() - data.updatedAt > QUIET_MS); if (settings.overlayHideQuiet && Date.now() - data.updatedAt > QUIET_MS) render(); } }, 1000);
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local' || !alive) return;
     if (changes.settings) {

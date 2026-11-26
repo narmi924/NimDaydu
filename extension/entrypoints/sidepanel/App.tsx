@@ -7,7 +7,7 @@ import { connectLocal, type Connection } from '../../lib/connection';
 import { IS_MAC, SETUP_SCRIPT } from '../../lib/platform';
 import { readableCaptions, groupParagraphs, previewUnits } from '../../lib/reader';
 import { LiveRows, ParagraphRow } from '../../lib/CaptionReader';
-import { exportCaptions } from '../../lib/export';
+import { exportCaptions, subtitleText } from '../../lib/export';
 import { exportDiagnostics } from '../../lib/export-diagnostics';
 import Icon from '../../lib/Icon';
 
@@ -30,8 +30,29 @@ export default function App() {
   const [working, setWorking] = useState(false);
   const [menu, setMenu] = useState(false);
   const [searching, setSearching] = useState(false);
+  const [hit, setHit] = useState(0);
   const [search, setSearch] = useState('');
   const [following, setFollowing] = useState(true);
+  const [editId, setEditId] = useState('');
+  const [alias, setAlias] = useState('');
+  const [replacement, setReplacement] = useState('');
+  const [scope, setScope] = useState('line');
+  const [editing, setEditing] = useState(false);
+  const editCaption = captions.find(c => c.id === editId);
+  async function commitTerm(undo = false) {
+    if (!editCaption) return;
+    setEditing(true);
+    try {
+      const result = await sendOffscreen({ type: 'editTerm', sessionId: editCaption.sessionId,
+        edit: { id: editCaption.id, alias, replacement, scope: undo ? 'undo' : scope } });
+      if (!result?.ok) throw new Error(result?.error || '纠词失败。');
+      setEditId('');
+    } catch (error) { setNotice(error instanceof Error ? error.message : '纠词失败。'); }
+    finally { setEditing(false); }
+  }
+  const [pageEnd, setPageEnd] = useState<number>();
+  const [idlePrompt, setIdlePrompt] = useState(false);
+  const lastSpeech = useRef(Date.now());
   const [elapsed, setElapsed] = useState(0);
   const settingsRef = useRef(settings);
   const stateRef = useRef(state);
@@ -82,7 +103,10 @@ export default function App() {
         if (message.preview) setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
       } else if (message.type === 'preview' && message.preview) {
         setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
-      } else if (message.type === 'translation') setCaptions(previous => applyTranslation(previous, message));
+      } else if (message.type === 'translation') {
+        setCaptions(previous => applyTranslation(previous, message));
+        setNotice(previous => previous === '英文已可使用，中文模型正在加载。' ? '' : previous);
+      }
       else if (message.type === 'translationStatus') showServiceStatus(message.status);
       else if (message.type === 'draft' && message.sessionId === stateRef.current.sessionId) setDrafts(previous => ({ ...previous, [message.key]: message.text }));
       else if (message.type === 'cleared') { setCaptions([]); setPreview(undefined); setDrafts({}); }
@@ -147,12 +171,21 @@ export default function App() {
       const next = await connect();
       if (!next) return;
       const mode = settingsRef.current.translationMode;
-      if (mode === 'offline' && !next.offlineTranslationReady) throw new Error(`本机翻译模型未就绪，请重新运行 ${SETUP_SCRIPT}，然后重启本机服务。`);
+      if (mode === 'offline' && next.translationState === 'failed') setNotice(`中文模型未能加载，可运行 ${SETUP_SCRIPT} 修复。英文可继续转录。`);
+      else if (mode === 'offline' && next.translationState === 'loading') setNotice('英文已可使用，中文模型正在加载。');
       const result = await browser.runtime.sendMessage({ target: 'background', type: 'start', token: next.token,
         sentenceHold: settingsRef.current.sentenceHold });
       if (result?.error) setNotice(result.error);
     } catch (error) { setNotice(error instanceof Error ? error.message : '启动失败。'); }
     finally { setWorking(false); }
+  }
+
+  function startDesktop() {
+    setMenu(false);
+    const paired = connectionRef.current;
+    if (!paired) { setNotice('请先连接本机服务。'); return; }
+    void browser.runtime.sendMessage({ target: 'background', type: 'startDesktop', token: paired.token })
+      .then(result => { if (!result?.ok) setNotice(result?.error || '桌面音频启动失败。'); }).catch(() => setNotice('桌面音频启动失败。'));
   }
 
   async function toggleOverlay() {
@@ -179,9 +212,32 @@ export default function App() {
 
   const mode = settings.translationMode === 'off' ? 'original' : settings.viewMode;
   const readable = useMemo(() => readableCaptions(captions, mode, translationFailed), [captions, mode, translationFailed]);
-  const visible = useMemo(() => search.trim() ? readable.filter(c => `${c.text} ${c.translation || ''}`.toLowerCase().includes(search.trim().toLowerCase())) : readable, [readable, search]);
+  const visible = useMemo(() => search.trim() ? readable.filter(c => `${c.text} ${c.recognizedText || ''} ${c.translation || ''}`.toLowerCase().includes(search.trim().toLowerCase())) : readable, [readable, search]);
   const paragraphs = useMemo(() => groupParagraphs(visible), [visible]);
+  const end = Math.min(pageEnd ?? paragraphs.length, paragraphs.length);
+  const page = paragraphs.slice(Math.max(0, end - 60), end);
+  function jumpHit(direction: number) {
+    if (!visible.length) return;
+    const i = (hit + direction + visible.length) % visible.length;
+    setHit(i); setFollowing(false);
+    const caption = visible[i]!;
+    const group = paragraphs.findIndex(p => p.captions.includes(caption));
+    setPageEnd(Math.min(paragraphs.length, (Math.floor(group / 60) + 1) * 60));
+    requestAnimationFrame(() => scrollRef.current?.querySelector(`[data-caption-id="${CSS.escape(caption.id)}"]`)?.scrollIntoView({ block: 'center' }));
+  }
   const active = isActive(state.phase);
+  useEffect(() => {
+    lastSpeech.current = Date.now(); setIdlePrompt(false);
+  }, [preview?.text, captions.length, state.phase]);
+  useEffect(() => {
+    if (!settings.idleReminder || state.phase !== 'capturing') return;
+    const timer = setInterval(() => { if (Date.now() - lastSpeech.current >= 600000) setIdlePrompt(true); }, 5000);
+    return () => clearInterval(timer);
+  }, [settings.idleReminder, state.phase]);
+  useEffect(() => {
+    setPageEnd(search.trim() ? 60 : undefined);
+    if (search.trim() && scrollRef.current) scrollRef.current.scrollTop = 0;
+  }, [search, state.sessionId]);
   const currentSource = active ? state.source : source || state.source;
   const waitingTranslation = !translationFailed && mode !== 'original' && captions.some(c => c.translationRevision !== c.revision);
   // Rows already show live English and reserved Chinese slots; a status line
@@ -203,9 +259,13 @@ export default function App() {
         <div className="menu-wrap" ref={menuRef}>
           <button className="icon-button" title="更多" aria-label="更多" aria-expanded={menu} aria-haspopup="menu" onClick={() => setMenu(v => !v)}><Icon name="more"/></button>
           {menu && <div className="menu" role="menu">
+            <button role="menuitem" disabled={active || !connection} onClick={startDesktop}>转录桌面声音…</button>
             <button role="menuitem" onClick={() => { setSearching(true); setMenu(false); }}>搜索字幕</button>
             <button role="menuitem" aria-label="导出双语 TXT" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'txt'); setMenu(false); }}>导出 TXT</button>
             <button role="menuitem" aria-label="导出字幕 JSON" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'json'); setMenu(false); }}>导出 JSON</button>
+            {(['srt', 'md'] as const).map(format => <button key={format} role="menuitem" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, format); setMenu(false); }}>导出 {format === 'md' ? 'Markdown' : 'SRT'}</button>)}
+            <button role="menuitem" disabled={!captions.length} onClick={() => { void navigator.clipboard.writeText(subtitleText(visible, 'md')).catch(() => setNotice('复制失败，请使用导出。')); setMenu(false); }}>复制双语字幕</button>
+            <button role="menuitem" onClick={() => { void browser.tabs.create({ url: browser.runtime.getURL('/library.html' as never) }); setMenu(false); }}>历史记录与文件转录</button>
             <button role="menuitem" onClick={() => { void exportDiagnostics(translationStatus); setMenu(false); }}>导出诊断</button>
             <div className="menu-divider"/>
             <button role="menuitem" disabled={active || !captions.length} onClick={() => void control('clear')}>清空字幕</button>
@@ -218,21 +278,31 @@ export default function App() {
       <div className="session-meta"><span className={`status-dot ${state.phase}`}/><span>{state.phase === 'capturing' && state.recovering ? '正在追赶' : PHASE_LABELS[state.phase]}</span>{state.startedAt && <time>{timestamp(elapsed)}</time>}<span className="languages">EN → 中文</span></div>
     </section>
     {(notice || state.saveError || state.message || translationMessage) && <div className="notice" role="status"><p>{notice || state.saveError || state.message || translationMessage}</p>{translationStatus.failed > 0 && <button className="text-button" disabled={repairing} onClick={() => void repairTranslation()}>{repairing ? '恢复中…' : '恢复翻译'}</button>}{notice && <button className="icon-button small" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="close" size={14}/></button>}</div>}
-    {searching && <div className="search-row"><Icon name="search" size={16}/><input aria-label="搜索字幕" placeholder="搜索字幕" value={search} autoFocus onChange={e => setSearch(e.target.value)} onKeyDown={e => { if (e.key === 'Escape') { setSearching(false); setSearch(''); } }}/><button className="icon-button small" aria-label="关闭搜索" onClick={() => { setSearching(false); setSearch(''); }}><Icon name="close" size={14}/></button></div>}
+    {editCaption && <form className="term-form" onSubmit={e => { e.preventDefault(); void commitTerm(); }}>
+      <p>{editCaption.recognizedText || editCaption.text}</p>
+      <label>听成<input required maxLength={100} value={alias} onChange={e => setAlias(e.target.value)}/></label>
+      <label>改为<input required maxLength={100} value={replacement} onChange={e => setReplacement(e.target.value)}/></label>
+      <select aria-label="纠词范围" value={scope} onChange={e => setScope(e.target.value)}><option value="line">仅这句</option><option value="session">整场</option><option value="remember">整场及以后</option></select>
+      <button disabled={editing}>应用</button><button type="button" disabled={editing} onClick={() => void commitTerm(true)}>撤销上次纠词</button><button type="button" onClick={() => setEditId('')}>关闭</button></form>}
+    {searching && <div className="search-row"><Icon name="search" size={16}/><input aria-label="搜索字幕" placeholder="搜索字幕" value={search} autoFocus onChange={e => { setSearch(e.target.value); setHit(0); setFollowing(false); }} onKeyDown={e => { if (e.key === 'Escape') { setSearching(false); setSearch(''); } }}/>{search && visible.length > 0 && <><span>{Math.min(hit + 1, visible.length)}/{visible.length}</span><button aria-label="上一条匹配" onClick={() => jumpHit(-1)}>↑</button><button aria-label="下一条匹配" onClick={() => jumpHit(1)}>↓</button></>}<button className="icon-button small" aria-label="关闭搜索" onClick={() => { setSearching(false); setSearch(''); }}><Icon name="close" size={14}/></button></div>}
     <div className="transcript" aria-label="双语字幕" ref={scrollRef} onScroll={() => {
       const element = scrollRef.current;
       if (element) setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 70);
     }}>
-      {paragraphs.map(paragraph => <ParagraphRow key={paragraph.id} paragraph={paragraph} mode={mode}/>)}
-      {visiblePreview && <LiveRows preview={preview} mode={mode} drafts={drafts}/>}
+      {end > 60 && <button className="text-button" onClick={() => { setFollowing(false); setPageEnd(end - 60); scrollRef.current?.scrollTo(0, 0); }}>前 60 段</button>}
+      {page.map(paragraph => <ParagraphRow key={paragraph.id} paragraph={paragraph} mode={mode} match={search} onEdit={id => { setEditId(id); setAlias(window.getSelection()?.toString().trim() || ''); setReplacement(''); setScope('line'); }}/>)}
+      {end < paragraphs.length && <button className="text-button" onClick={() => setPageEnd(Math.min(paragraphs.length, end + 60))}>后 60 段</button>}
+      {visiblePreview && end === paragraphs.length && <LiveRows preview={preview} mode={mode} drafts={drafts}/>}
       {!visible.length && !visiblePreview && <div className="empty-state">
+        {!active && !search && connection && <button className="text-button" onClick={() => void browser.tabs.create({ url: 'http://127.0.0.1:8765/sample/' })}>试听英语样本</button>}
         <p className="empty-title">{search ? '没有匹配的字幕' : active ? mode === 'translated' ? '等待完整译文' : '等待语音' : checking ? '正在连接本机服务' : connectionError ? '本机服务未连接' : '开始后显示双语字幕'}</p>
         {!search && <p>{active ? mode === 'translated' ? '句子整理和翻译完成后会显示在这里。' : '英文实时显示，中文在句子完成后更新。' : connectionError || '播放网页中的声音，然后点击开始。'}</p>}
         {!active && connectionError && <button className="text-button" onClick={() => { setChecking(true); void connect(); }}>重新连接</button>}
       </div>}
       {pendingLabel && !search && <div className="pending" role="status"><span className="pending-dot"/>{pendingLabel}</div>}
     </div>
-    {!following && (readable.length > 0 || visiblePreview) && <button className="back-to-live" onClick={() => { setSearch(''); setFollowing(true); }}><Icon name="arrow" size={14}/>回到最新</button>}
+    {!following && (readable.length > 0 || visiblePreview) && <button className="back-to-live" onClick={() => { setSearch(''); setPageEnd(undefined); setFollowing(true); }}><Icon name="arrow" size={14}/>回到最新</button>}
+    {idlePrompt && settings.idleReminder && state.phase === 'capturing' && <div className="notice" role="status">十分钟没有新字幕。<button onClick={() => { lastSpeech.current = Date.now(); setIdlePrompt(false); }}>继续听</button><button onClick={() => void control('stop')}>结束</button></div>}
     <footer className="controls">
       {!active ? <button className="button primary" onClick={() => void start()} disabled={working || checking || !source}><Icon name="play" size={16}/>{working ? '连接中…' : '开始'}</button>
         : <><button className="button primary" onClick={() => void control(state.phase === 'paused' ? 'resume' : 'pause')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name={state.phase === 'paused' ? 'play' : 'pause'} size={16}/>{state.phase === 'paused' ? '继续' : '暂停'}</button><button className="button stop" onClick={() => void control('stop')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name="stop" size={16}/>结束</button></>}

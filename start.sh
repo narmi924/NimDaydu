@@ -1,5 +1,5 @@
 #!/bin/bash
-# Start the NimDaydu local service on macOS. Logs: .nimdaydu/service.err.log
+# Start the NimDaydu local service on macOS and Linux. Logs: .nimdaydu/service.err.log
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT="$PWD"
@@ -29,7 +29,7 @@ state="$(health)"
 case "$state" in
   ready) echo 'NimDaydu 已在运行。'; exit 0 ;;
   other) echo '端口 8765 被其他程序占用。' >&2; exit 1 ;;
-  loading|error:*) echo 'NimDaydu 正在运行但模型未就绪。请先运行 Stop-NimDaydu.command，再重新启动；详情见 .nimdaydu/service.err.log。' >&2; exit 1 ;;
+  loading|error:*) echo 'NimDaydu 正在运行但模型未就绪。请先运行 ./stop.sh，再重新启动；详情见 .nimdaydu/service.err.log。' >&2; exit 1 ;;
 esac
 
 # A new session detaches the service from this Terminal window, so closing
@@ -54,7 +54,7 @@ for _ in $(seq 1 300); do
   state="$(health)"
   case "$state" in
     ready)
-      summary="$(curl -s -m 2 http://127.0.0.1:8765/health | "$PY" -c 'import json,sys; d=json.load(sys.stdin); print("识别", d["model"], "· 翻译", d.get("translationEngine") or "未就绪")')"
+      summary="$(curl -s -m 2 http://127.0.0.1:8765/health | "$PY" -c 'import json,sys; d=json.load(sys.stdin); print("识别", d["model"], "· 翻译", d.get("translationEngine") or "Hy-MT2 按需加载")')"
       echo "NimDaydu 已就绪：$summary。音频只在这台 Mac 上处理。"
       echo 'Chrome 扩展会自动连接，无需配对码。可以关闭这个窗口。'
       exit 0 ;;
