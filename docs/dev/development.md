@@ -2,20 +2,22 @@
 
 > 维护者文档。安装和使用请看 [README](../../README.md)。
 
+NimDaydu 专注实时转录和翻译。开启自动保存后，外部 agent 可以在会中或会后读取 `OUTPUTS` 下的 `session.json`。文件按字幕 ID 保存定稿英文、起止时间和随后补入的中文。会议纪要、决定、待办及其与原话的关联由读取文件的 agent 生成和更新。
+
 ## 结构
 
 ```text
 extension/              Chrome 扩展（WXT + React）
   entrypoints/background.ts        选择音源、启动采集、注入悬浮字幕
-  entrypoints/offscreen/main.ts    采音、与本机服务通信、本机模型/DeepSeek 翻译队列
-  entrypoints/sidepanel/           侧栏阅读器；只有 Chrome 内置翻译在这里执行
+  entrypoints/offscreen/main.ts    采音、与本机服务通信、本机模型翻译队列
+  entrypoints/sidepanel/           侧栏阅读器
   entrypoints/overlay.content.ts   网页悬浮字幕（运行时注入，Shadow DOM + Popover 顶层）
   entrypoints/options/             设置页
 local-service/          本机服务（FastAPI）
   nimdaydu/engine.py               Moonshine 实时草稿（自定义刷新节奏、积压时跳过刷新）
   nimdaydu/refinement.py           Parakeet 整句复核（合并上限 15 秒，重叠词去重）
   nimdaydu/segmentation.py         成句、按从句切成字幕单元（≤16 词）
-  nimdaydu/translation.py          HY-MT（llama.cpp 子进程）与 OPUS-MT 备用
+  nimdaydu/translation.py          Hy-MT2-1.8B（llama.cpp 子进程）
   nimdaydu/system.py               平台差异：脚本名、Windows 关闭后台节能降速
 setup.ps1 / start.ps1 / stop.ps1   Windows
 setup.sh / start.sh / stop.sh      macOS（Apple 芯片）
@@ -25,7 +27,7 @@ setup.sh / start.sh / stop.sh      macOS（Apple 芯片）
 
 1. 侧栏“开始”经 background 取得 tabCapture 流，offscreen 文档把 48 kHz PCM 发送到 `ws://127.0.0.1:8765/audio`。
 2. 服务端 Moonshine 产生实时英文，Parakeet 复核定稿，`SentenceAssembler` 成句并切成字幕单元（`continued` 表示句子在下一条继续）。
-3. offscreen 收到定稿后，本机模型与 DeepSeek 模式直接在 offscreen 翻译（侧栏隐藏或关闭也不受影响）；Chrome 内置翻译需要可见页面，仍由侧栏“认领”翻译。
+3. offscreen 收到定稿后，调用本机 Hy-MT2-1.8B 翻译；侧栏隐藏或关闭也不受影响。
 4. offscreen 通过 runtime 消息更新侧栏，通过 `runtime.connect('nimdaydu-overlay')` 端口推送给悬浮字幕；悬浮字幕连接期间也算作打开的视图。
 5. 侧栏和悬浮字幕都关闭约 10 秒后停止采集。
 
@@ -55,10 +57,14 @@ v0.6 的翻译与复核模型比较（COMET-22、EdAcc WER、AMI 会议重放）
 
 ## 模型选择
 
+实时字幕优先启动速度、翻译延迟和方便停止；翻译只使用 Hy-MT2-1.8B Q4，不保留较大模型、其他翻译方式或备用模型。
+
+独立文本翻译工具位于相邻的 `OfflineTranslator` 文件夹，双击 `OfflineTranslator.exe` 启动。它只复用 GGUF 模型文件和 llama.cpp 程序，不依赖 NimDaydu 服务，也不加载 Moonshine 或 Parakeet。关闭翻译窗口时同时退出它启动的翻译进程并释放内存，不驻留后台。
+
 两个平台使用同一组模型，只有 llama.cpp 后端不同（Windows：Vulkan，macOS：Metal）：
 
 - **复核**：Parakeet TDT v3 INT8。在 EdAcc 150 段非母语对话上，v2 13.9% / v3 14.2%（噪声内），Cohere Transcribe INT8 31.1%。公开榜单更准的 Qwen3-ASR-1.7B 在 macOS 需要 MLX 运行时，未在真机验证前不采用。
-- **翻译**：HY-MT1.5-1.8B Q4_K_M。真实 Discord 字幕 COMET 81.3、WMT24++ 85.8（OPUS-MT 73.9 / 71.2）；Q8 不更好；7B 只高约 1 分，却多占约 3.5 GB、慢约 3 倍，对 16 GB 的 Mac 和 Windows 核显都不划算，作为 `download_llm.py --model hy-mt1.5-7b-q4` 的可选项。1.8B 带上下文时会把上一句一起译出（COMET 降到 77.4），所以每句单独翻译。
+- **翻译**：Hy-MT2-1.8B Q4_K_M，服务启动时与识别模型并行加载。每句单独翻译；小模型仍可能误译网络俚语。v0.6 的质量与速度分数只适用于当时的模型，不代表 Hy-MT2 的实测效果。
 
 ## macOS 版本的验证范围
 

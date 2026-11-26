@@ -18,8 +18,6 @@ let lastLease = Date.now();
 let lastMeter = 0;
 let sequence = 0;
 let stopping: Promise<void> | undefined;
-let translationOwner: string | undefined;
-const viewLeases = new Map<string, number>();
 // Match the service's finite recovery window rather than aborting a brief burst.
 const TRANSPORT_BACKLOG_SECONDS = 8;
 let fileSaveFailed = false;
@@ -37,20 +35,17 @@ const outputs = new OutputSync(failed => { translationSaveFailed = failed; savin
 // Only chrome.runtime is available in an offscreen document. Settings are
 // read/watched by the service worker and delivered through runtime messages.
 
-// The local model and DeepSeek are translated here, so captions keep their
-// Chinese while the side panel is hidden (fullscreen) or closed. Chrome's own
-// translator only exists in a visible page; that mode stays with the side panel.
-let translationMode: TranslationMode | undefined;
+// Translate in the capture page so closing the side panel does not pause Chinese.
+let translationMode: TranslationMode = DEFAULT_SETTINGS.translationMode;
 let serviceToken = '';
 let translationStatus: TranslationStatus = { pending: 0, failed: 0, retrying: 0, running: false };
-const servesTranslation = () => translationMode === 'offline' || translationMode === 'deepseek';
+const servesTranslation = () => translationMode === 'offline';
 const serviceQueue = new TranslationQueue(
   (caption, signal) => {
     // A live draft of the same words was already translated: no second model call.
     const drafted = draftModel.get(draftKey(caption.text));
     if (drafted !== undefined) return Promise.resolve(drafted);
-    return serviceTranslate(caption.text, serviceToken,
-      captions.filter(c => c.final && c.start < caption.start).slice(-2).map(c => c.text), translationMode as 'offline' | 'deepseek', signal);
+    return serviceTranslate(caption.text, serviceToken, signal);
   },
   (caption, text) => acceptTranslation({ sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text }),
   () => {}, { onChange: status => {
@@ -62,7 +57,7 @@ const serviceQueue = new TranslationQueue(
 // being spoken, unless it already ends a sentence) are translated while the
 // local model is idle. Chinese then
 // appears as the sentence ends instead of after the second pass, and the
-// settled caption reuses it when the words agree. Paid DeepSeek is not used.
+// settled caption reuses it when the words agree.
 const draftModel = new Map<string, string>();
 let drafts: DraftTranslations = {};
 let drafting = false;
@@ -79,7 +74,7 @@ async function pumpDrafts() {
   const session = state.sessionId;
   let done = false;
   try {
-    const text = await serviceTranslate(unit, serviceToken, [], 'offline', AbortSignal.timeout(8000), true);
+    const text = await serviceTranslate(unit, serviceToken, AbortSignal.timeout(8000), true);
     if (session !== state.sessionId) return;
     const key = draftKey(unit);
     draftModel.set(key, text);
@@ -117,12 +112,11 @@ function acceptTranslation(message: { sessionId: string; id: string; revision: n
   publish({ type: 'translation', ...message });
 }
 
-function setTranslationMode(mode: TranslationMode | undefined) {
+function setTranslationMode(mode: TranslationMode) {
   if (mode === translationMode) return;
   serviceQueue.reset();
   resetDrafts();
   translationMode = mode;
-  translationOwner = undefined;
   if (servesTranslation()) captions.forEach(caption => serviceQueue.enqueue(caption));
 }
 function setState(update: Partial<CaptureState>) {
@@ -162,19 +156,17 @@ async function stop(message?: string, failed = false) {
   return stopping;
 }
 
-async function start(source: Source, streamId: string, token: string, viewId: string, canTranslate: boolean, sentenceHold: number, autoSave: boolean, mode?: TranslationMode) {
+async function start(source: Source, streamId: string, token: string, sentenceHold: number, autoSave: boolean, mode: TranslationMode = DEFAULT_SETTINGS.translationMode) {
   if (isActive(state.phase)) throw new Error('已有会话运行中。');
   await cleanup();
   captions = [];
   preview = undefined;
   sequence = 0;
   lastLease = Date.now();
-  viewLeases.set(viewId, lastLease);
   serviceQueue.reset();
   resetDrafts();
   translationMode = mode;
   serviceToken = token;
-  translationOwner = canTranslate && !servesTranslation() ? viewId : undefined;
   state = { phase: 'starting', source, startedAt: Date.now() };
   setState({});
   try {
@@ -295,14 +287,9 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
     }
     if (message.type === 'lease') {
       lastLease = Date.now();
-      viewLeases.set(message.viewId, lastLease);
-      for (const [id, timestamp] of viewLeases) if (lastLease - timestamp > 10000) viewLeases.delete(id);
-      if (translationOwner && !viewLeases.has(translationOwner)) translationOwner = undefined;
-      if (message.canTranslate && !translationOwner && !servesTranslation()) translationOwner = message.viewId;
-      if (!message.canTranslate && translationOwner === message.viewId) translationOwner = undefined;
-      return { owner: translationOwner === message.viewId };
+      return { ok: true };
     }
-    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.viewId, message.canTranslate, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode);
+    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode);
     if (message.type === 'pause' && state.phase === 'capturing') {
       setState({ phase: 'paused' });
       socket?.send(JSON.stringify({ type: 'pause' }));
@@ -311,10 +298,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       setState({ phase: 'capturing' });
     } else if (message.type === 'stop') await stop();
     else if (message.type === 'sourceClosed' && message.tabId === state.source?.tabId && isActive(state.phase)) await stop('来源标签页已关闭。');
-    else if (message.type === 'translation') {
-      if (servesTranslation() || message.viewId !== translationOwner) return { ok: false };
-      acceptTranslation({ sessionId: message.sessionId, id: message.id, revision: message.revision, text: message.text });
-    } else if (message.type === 'retryTranslation' && servesTranslation()) {
+    else if (message.type === 'retryTranslation' && servesTranslation()) {
       serviceQueue.retryFailed();
       captions.forEach(caption => serviceQueue.enqueue(caption));
     } else if (message.type === 'clear' && !isActive(state.phase)) {

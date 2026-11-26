@@ -85,7 +85,7 @@ winget install --id OpenJS.NodeJS.LTS -e
 |---|---|
 | 双击 Start-NimDaydu.cmd 后窗口一闪而过 | 在 NimDaydu 文件夹的 PowerShell 里运行 `.\start.ps1` 查看提示。详细日志在 `.nimdaydu\service.err.log` |
 | 提示找不到 uv 或 node | 回到第 1 步安装，然后关闭再重新打开 PowerShell |
-| 设置页显示翻译模型是 OPUS-MT | 说明 HY-MT 没有启动成功。更新显卡驱动后，重新运行 `setup.ps1`。日志在 `.nimdaydu\translator.log` |
+| 提示本机翻译模型未就绪 | 重新运行 `setup.ps1` 并重启本机服务。日志在 `.nimdaydu/translator.log` |
 | 提示“语音识别持续积压” | 关闭视频剪辑、大型游戏等占用 CPU 很多的程序。笔记本插电使用效果更好 |
 | 端口 8765 被占用 | 先双击 Stop-NimDaydu.cmd。如果还是不行，重启电脑 |
 

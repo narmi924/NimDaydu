@@ -104,11 +104,12 @@ it('keeps capture running while a backlog starts and clears', async () => {
 });
 
 it('cleans up a fatal peer error immediately and preserves settled bilingual captions', async () => {
-  await start();
+  await start(false);
+  vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({ text: '你好，Discord。' })));
   sockets[0]!.emit({ type: 'caption', sessionId: 'session-1', id: 'sentence:1', revision: 1,
     final: true, text: 'Hello Discord.', start: 0, end: 1,
     preview: { revision: 1, text: '', start: 0, end: 0 } });
-  await command('translation', { viewId: 'view', sessionId: 'session-1', id: 'sentence:1', revision: 1, text: '你好，Discord。' });
+  await vi.advanceTimersByTimeAsync(1);
   const before = Date.now();
   sockets[0]!.emit({ type: 'error', code: 'asr_overload', message: '语音识别持续积压。' });
   for (let index = 0; index < 10; index++) await Promise.resolve();
@@ -157,13 +158,12 @@ it('translates with the local service here, so Chinese continues while the side 
   await vi.advanceTimersByTimeAsync(10);
   const requests = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith('/translate'))
     .map(([, init]) => JSON.parse(init!.body as string));
-  expect(requests).toEqual([{ text: 'First line.', context: [], provider: 'offline' },
-    { text: 'Second line.', context: ['First line.'], provider: 'offline' }]);
+  expect(requests).toEqual([{ text: 'First line.' },
+    { text: 'Second line.' }]);
   const snapshot = await command('snapshot');
   expect(snapshot.captions.map((c: any) => c.translation)).toEqual(['第一句。', '第二句。']);
   expect(snapshot.serviceTranslation).toBe(true);
   // A view cannot overwrite what the capture page translated.
-  expect(await command('translation', { viewId: 'view', sessionId: 'session-1', id: 'sentence:1', revision: 1, text: '别的' })).toEqual({ ok: false });
   expect(runtime.sendMessage.mock.calls.some(([message]) => message.type === 'translation' && message.text === '第二句。')).toBe(true);
 });
 
@@ -200,7 +200,7 @@ it('translates finished live rows early and reuses them when the caption settles
     units: ['Check availability.', 'Then we'], start: 0, end: 2 });
   await vi.advanceTimersByTimeAsync(10);
   // Only the finished row is drafted; the row still being spoken is not.
-  expect(requests).toEqual([{ text: 'Check availability.', context: [], provider: 'offline', draft: true }]);
+  expect(requests).toEqual([{ text: 'Check availability.', draft: true }]);
   sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 2, text: 'Check availability. Then we pay.',
     units: ['Check availability.', 'Then we pay.'], start: 0, end: 3 });
   await vi.advanceTimersByTimeAsync(10);
@@ -216,9 +216,9 @@ it('translates finished live rows early and reuses them when the caption settles
   expect((await command('snapshot')).captions[0].translation).toBe('检查可用性。');
 });
 
-it('never drafts with paid DeepSeek', async () => {
+it('does not translate when translation is disabled', async () => {
   await command('start', { source: { tabId: 1, windowId: 1, title: 'Meeting' }, streamId: 'stream', token: 'test-token',
-    viewId: 'view', canTranslate: false, sentenceHold: .4, autoSave: false, translationMode: 'deepseek' });
+    viewId: 'view', canTranslate: false, sentenceHold: .4, autoSave: false, translationMode: 'off' });
   sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'Check availability. Then we',
     units: ['Check availability.', 'Then we'], start: 0, end: 2 });
   await vi.advanceTimersByTimeAsync(10);

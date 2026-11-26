@@ -1,7 +1,7 @@
 import { browser } from 'wxt/browser';
 import { SERVICE, readSettings, type Settings } from './types';
 import { SETUP_SCRIPT, START_SCRIPT } from './platform';
-export type Connection = { token: string; ready: boolean; offlineTranslationReady: boolean; translationEngine?: string; platform?: string; deepseekConfigured: boolean; deepseekModel?: string; model: string; version: string; error?: string; outputDirectory?: string };
+export type Connection = { token: string; ready: boolean; offlineTranslationReady: boolean; translationEngine?: string; platform?: string; model: string; version: string; error?: string; outputDirectory?: string };
 let connecting: Promise<Connection> | undefined;
 export async function connectLocal(): Promise<Connection> {
   if (connecting) return connecting;
@@ -15,7 +15,7 @@ export async function connectLocal(): Promise<Connection> {
     if (!result.ready) throw new Error(`语音模型未就绪，请运行 ${SETUP_SCRIPT} 后重启本机服务。`);
     const raw = (await browser.storage.local.get('settings')).settings as Partial<Settings> | undefined;
     const stored = readSettings(raw);
-    if (stored.token !== result.token || raw?.schema !== 2) await browser.storage.local.set({ settings: { ...stored, token: result.token } });
+    if (stored.token !== result.token || raw?.schema !== stored.schema || raw?.translationMode !== stored.translationMode) await browser.storage.local.set({ settings: { ...stored, token: result.token } });
     return result;
   })().finally(() => { connecting = undefined; });
   return connecting;

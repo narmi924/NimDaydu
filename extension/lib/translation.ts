@@ -2,8 +2,6 @@ import { SERVICE, type Caption } from './types';
 import { errorName, recordDiagnostic } from './diagnostics';
 import { SETUP_SCRIPT } from './platform';
 
-type TranslatorInstance = { translate(text: string, options?: { signal: AbortSignal }): Promise<string>; destroy(): void };
-
 /** Also bounds APIs that fail to honour AbortSignal; late results are ignored. */
 function bounded<T>(work: (signal: AbortSignal) => Promise<T>, timeoutMs: number, external?: AbortSignal): Promise<T> {
   const controller = new AbortController();
@@ -27,78 +25,12 @@ export function finalTranslation(text: string, incomplete = false, continued = f
   // Closing quotes may come out as opening ones (“…。“); either way the sentence has ended.
   return /[。！？!?…][”’“‘"」]*$/.test(cleaned) ? cleaned : cleaned + '。';
 }
-type TranslatorFactory = {
-  availability(options: { sourceLanguage: string; targetLanguage: string }): Promise<string>;
-  create(options: { sourceLanguage: string; targetLanguage: string; signal?: AbortSignal; monitor?: (monitor: EventTarget) => void }): Promise<TranslatorInstance>;
-};
-declare global { interface Window { Translator?: TranslatorFactory } }
-
-export class LocalTranslator {
-  private instance?: TranslatorInstance;
-  private preparing?: Promise<void>;
-  private preparation?: AbortController;
-  private generation = 0;
-  get ready() { return Boolean(this.instance); }
-
-  async availability(): Promise<string> {
-    if (!window.Translator) return 'unsupported';
-    return bounded(() => window.Translator!.availability({ sourceLanguage: 'en', targetLanguage: 'zh' }), 5000);
-  }
-
-  prepare(onProgress: (value: number) => void, signal?: AbortSignal): Promise<void> {
-    if (this.instance) return Promise.resolve();
-    if (this.preparing) return this.preparing;
-    if (!window.Translator) return Promise.reject(new Error('这版 Chrome 未提供本地翻译 API。可以先使用英文字幕，或主动选择 DeepSeek。'));
-    const generation = this.generation;
-    const preparation = new AbortController();
-    this.preparation = preparation;
-    // Start create synchronously while a button's user activation is available.
-    const pending = bounded(abort => window.Translator!.create({ sourceLanguage: 'en', targetLanguage: 'zh', signal: abort, monitor(monitor) {
-      monitor.addEventListener('downloadprogress', event => onProgress((event as Event & { loaded: number }).loaded));
-    } }).then(instance => {
-      if (abort.aborted || generation !== this.generation) {
-        instance.destroy(); throw new DOMException('操作已取消', 'AbortError');
-      }
-      this.instance = instance;
-      recordDiagnostic('translation', 'chrome_ready');
-    }), 180000, signal ? AbortSignal.any([signal, preparation.signal]) : preparation.signal);
-    this.preparing = pending;
-    void pending.finally(() => {
-      if (this.preparing === pending) { this.preparing = undefined; this.preparation = undefined; }
-    }).catch(() => {});
-    return pending;
-  }
-
-  async translate(text: string, signal?: AbortSignal) {
-    return bounded(async abort => {
-      if (!this.instance) {
-        if (await this.availability() !== 'available') throw new DOMException('请在设置中准备 Chrome 翻译语言包。', 'NotSupportedError');
-        await this.prepare(() => {}, abort);
-      }
-      if (abort.aborted) throw abort.reason;
-      const instance = this.instance!;
-      try { return await bounded(cancel => instance.translate(text, { signal: cancel }), 8000, abort); }
-      catch (error) {
-        if (this.instance === instance) { this.instance = undefined; try { instance.destroy(); } catch { /* Chrome may already have disconnected. */ } }
-        recordDiagnostic('translation', 'chrome_invalidated', { errorName: errorName(error) });
-        throw error;
-      }
-    }, 15000, signal);
-  }
-
-  destroy() {
-    this.generation++; this.preparation?.abort(); this.preparing = undefined; this.preparation = undefined;
-    const instance = this.instance; this.instance = undefined;
-    try { instance?.destroy(); } catch { /* Already disconnected. */ }
-  }
-}
-
-export async function serviceTranslate(text: string, token: string, context: string[], provider: 'offline' | 'deepseek', signal?: AbortSignal, draft = false): Promise<string> {
+export async function serviceTranslate(text: string, token: string, signal?: AbortSignal, draft = false): Promise<string> {
   const response = await fetch(`${SERVICE}/translate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify(draft ? { text, context, provider, draft } : { text, context, provider }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(22000)]) : AbortSignal.timeout(22000),
+    body: JSON.stringify(draft ? { text, draft } : { text }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(22000)]) : AbortSignal.timeout(22000),
   });
-  if (!response.ok) throw new Error(provider === 'offline' ? (response.status === 503 ? `本机翻译模型未就绪，请运行 ${SETUP_SCRIPT} 并重启服务。` : '本机翻译暂时失败，稍后自动重试。') : response.status === 503 ? '尚未配置 DeepSeek 密钥，请在设置中填写。' : 'DeepSeek 翻译失败，请检查服务、密钥及网络。');
+  if (!response.ok) throw new Error(response.status === 503 ? `本机翻译模型未就绪，请运行 ${SETUP_SCRIPT} 并重启服务。` : '本机翻译暂时失败，稍后自动重试。');
   const result = await response.json();
   return result.text;
 }

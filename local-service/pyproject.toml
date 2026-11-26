@@ -12,8 +12,6 @@ dependencies = [
   "numpy>=2,<3",
   "httpx>=0.28,<1",
   "python-dotenv>=1,<2",
-  "ctranslate2>=4.6,<5",
-  "sentencepiece>=0.2,<1",
 ]
 
 [dependency-groups]

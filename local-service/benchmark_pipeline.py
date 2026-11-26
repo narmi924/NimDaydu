@@ -45,7 +45,7 @@ async def benchmark(wav_path, output, sample_rate=None, pause_at=None, pause_for
                 request_time = time.perf_counter()
                 try:
                     response = await client.post('http://127.0.0.1:8765/translate',
-                        headers={'Authorization': f'Bearer {token}'}, json={'provider': 'offline', 'text': caption['text']})
+                        headers={'Authorization': f'Bearer {token}'}, json={'text': caption['text']})
                     response.raise_for_status()
                     caption['translation'] = response.json()['text']
                     caption['translationSeconds'] = round(time.perf_counter() - request_time, 3)

@@ -115,7 +115,7 @@ export default defineBackground(() => {
           if (['starting', 'capturing', 'paused', 'stopping'].includes(snapshot.state.phase)) throw new Error('已有字幕会话，请先停止。');
           const streamId = await browser.tabCapture.getMediaStreamId({ targetTabId: source.tabId });
           const settings = readSettings((await browser.storage.local.get('settings')).settings as Partial<Settings> | undefined);
-          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, viewId: message.viewId, canTranslate: message.canTranslate, sentenceHold: message.sentenceHold, autoSave: settings.autoSave, translationMode: settings.translationMode });
+          const result = await browser.runtime.sendMessage({ target: 'offscreen', type: 'start', source, streamId, token: message.token, sentenceHold: message.sentenceHold, autoSave: settings.autoSave, translationMode: settings.translationMode });
           if (result?.error) throw new Error(result.error);
           if (!result?.ok) throw new Error('采音页面没有确认启动，请重新打开侧栏后重试。');
           // The page shows it according to the floating-caption setting.

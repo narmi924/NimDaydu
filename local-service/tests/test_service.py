@@ -52,8 +52,7 @@ class FakeTranslator:
 
 
 @pytest.fixture
-def service(tmp_path, monkeypatch):
-    monkeypatch.setenv('DEEPSEEK_API_KEY', '')
+def service(tmp_path):
     app = create_app(FakeEngine, tmp_path, FakeTranslator)
     token = json.loads((tmp_path / 'config.json').read_text())['token']
     with TestClient(app, base_url='http://127.0.0.1') as client:
@@ -146,14 +145,15 @@ def test_sequence_gap_closes_and_releases_engine(service):
     assert client.get('/health').json()['busy'] is False
 
 
-def test_deepseek_requires_key_and_never_automatically_falls_back(service):
+def test_local_translation_requires_authentication_and_uses_selected_model(service):
     client, token = service
     assert client.post('/translate', json={'text': 'Hello'}).status_code == 401
-    assert client.post('/translate', headers={'Authorization': f'Bearer {token}'}, json={'text': 'Hello'}).status_code == 503
     result = client.post('/translate', headers={'Authorization': f'Bearer {token}'},
-                         json={'text': 'Hello Discord', 'provider': 'offline', 'context': ['Earlier line.']})
-    assert result.json() == {'text': '你好，Discord。', 'provider': 'offline', 'engine': 'Fake-MT'}
+                         json={'text': 'Hello Discord'})
+    assert result.json() == {'text': '你好，Discord。', 'engine': 'Fake-MT'}
     assert client.get('/health').json()['translationEngine'] == 'Fake-MT'
+    assert client.post('/translate', headers={'Authorization': f'Bearer {token}'},
+                       json={'text': 'Hello', 'provider': 'deepseek'}).status_code == 422
 
 
 def test_auto_connect_only_exposes_token_to_fixed_extension_origin(service):
@@ -251,17 +251,10 @@ def test_model_selection_survives_restart_and_accepts_windows_setup_utf8_bom(tmp
     assert load_settings(tmp_path).model == 'hybrid'
 
 
-def test_optional_provider_key_is_local_and_not_returned_in_responses(service):
+def test_removed_provider_settings_are_unavailable(service):
     client, token = service
-    origin = 'chrome-extension://' + json.loads((ROOT / 'extension/identity.json').read_text())['extensionId']
-    headers = {'Origin': origin, 'Authorization': f'Bearer {token}'}
-    assert client.post('/providers/deepseek', headers={'Origin': origin}, json={'key': 'test-only-key'}).status_code == 401
-    response = client.post('/providers/deepseek', headers=headers, json={'key': 'test-only-key'})
-    assert response.json() == {'deepseekConfigured': True}
-    response = client.post('/connect', headers={'Origin': origin}, json={})
-    assert response.json()['deepseekConfigured'] is True
-    assert 'test-only-key' not in response.text
-    assert client.post('/providers/deepseek', headers=headers, json={'clear': True}).json() == {'deepseekConfigured': False}
+    assert client.post('/providers/deepseek', headers={'Authorization': f'Bearer {token}'},
+                       json={'key': 'test-only-key'}).status_code == 404
 
 
 def test_settled_captions_wait_for_the_model_while_live_drafts_give_way(tmp_path):
@@ -282,12 +275,12 @@ def test_settled_captions_wait_for_the_model_while_live_drafts_give_way(tmp_path
     with TestClient(app, base_url='http://127.0.0.1') as client:
         results = {}
         def settled(text):
-            results[text] = client.post('/translate', headers=headers, json={'text': text, 'provider': 'offline'}).status_code
+            results[text] = client.post('/translate', headers=headers, json={'text': text}).status_code
         first = threading.Thread(target=settled, args=('First.',)); first.start()
         time.sleep(.2)
         second = threading.Thread(target=settled, args=('Second.',)); second.start()
         time.sleep(.2)
-        draft = client.post('/translate', headers=headers, json={'text': 'Draft.', 'provider': 'offline', 'draft': True})
+        draft = client.post('/translate', headers=headers, json={'text': 'Draft.', 'draft': True})
         assert draft.status_code == 429
         gate.set(); first.join(); second.join()
         assert results == {'First.': 200, 'Second.': 200}

@@ -1,4 +1,4 @@
-"""Local English→Chinese translation: HY-MT1.5 via llama.cpp, OPUS-MT as fallback."""
+"""Local English→Chinese translation: Hy-MT2-1.8B via llama.cpp."""
 import ctypes
 import json
 import logging
@@ -13,9 +13,6 @@ from .config import ROOT
 from .system import IS_WINDOWS
 
 log = logging.getLogger('nimdaydu')
-CJK = '⺀-鿿　-〿＀-￯'
-# OPUS emits SentencePiece spaces between Chinese words ("使用 案件 下降").
-SPACES_IN_CHINESE = re.compile(rf'(?<=[{CJK}])\s+|\s+(?=[{CJK}])')
 
 
 def load_glossary():
@@ -32,40 +29,6 @@ def normalize_terms(terms, text):
     for pattern, spelling in terms:
         text = pattern.sub(lambda _match: spelling, text)
     return text
-
-
-class OfflineTranslator:
-    """OPUS-MT (Argos en→zh 1.9) on CTranslate2: small, but context-free and literal."""
-    name = 'OPUS-MT'
-
-    def __init__(self):
-        import ctranslate2
-        import sentencepiece as spm
-
-        manifest = json.loads((ROOT / 'models/translation/manifest.json').read_text())
-        directory = ROOT / manifest['path'].replace('\\', '/')
-        self.tokenizer = spm.SentencePieceProcessor(model_file=str(directory / 'sentencepiece.model'))
-        self.translator = ctranslate2.Translator(str(directory / 'model'), device='cpu', compute_type='int8', inter_threads=1, intra_threads=2)
-        self.prefix = json.loads((directory / 'metadata.json').read_text(encoding='utf-8')).get('target_prefix', '')
-        self.terms = load_glossary()
-
-    def translate(self, text: str, context=()) -> str:
-        text = normalize_terms(self.terms, text)
-        # ASR lines are short; split at sentence boundaries without installing
-        # another neural sentence segmenter and its Torch runtime.
-        sentences = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
-        tokens = [self.tokenizer.encode(sentence, out_type=str) for sentence in sentences]
-        if any(len(piece) > 512 for piece in tokens):
-            raise ValueError('Caption exceeds local translation model limit')
-        result = self.translator.translate_batch(tokens, target_prefix=[[self.prefix]] * len(tokens) if self.prefix else None,
-                                                 beam_size=3, replace_unknowns=True, max_input_length=512, max_decoding_length=512)
-        output = ''.join(self.tokenizer.decode(item.hypotheses[0]).replace('▁', ' ') for item in result).strip()
-        if self.prefix and output.startswith(self.prefix):
-            output = output[len(self.prefix):].strip()
-        return SPACES_IN_CHINESE.sub('', output)
-
-    def close(self):
-        pass
 
 
 def _kill_with_parent(process):
@@ -103,7 +66,7 @@ def _kill_with_parent(process):
 
 
 class LlamaTranslator:
-    """HY-MT1.5 in a private llama.cpp server listening only on localhost."""
+    """HY-MT in a private llama.cpp server listening only on localhost."""
     PROMPT = '将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}'
     START_TIMEOUT = 90
 
@@ -166,10 +129,7 @@ class LlamaTranslator:
             time.sleep(.25)
         raise RuntimeError('llama-server did not become ready')
 
-    def translate(self, text: str, context=()) -> str:
-        # Context stays unused: HY-MT's contextual prompt makes the 1.8B model
-        # translate earlier lines into short replies ("Uh so so so."), which
-        # scored COMET 77.4 against 81.3 without it on real Discord captions.
+    def translate(self, text: str) -> str:
         if self.process is None or self.process.poll() is not None:
             log.warning('Local translation server stopped; restarting')
             self._stop()
@@ -203,8 +163,4 @@ class LlamaTranslator:
 
 
 def create_translator():
-    try:
-        return LlamaTranslator()
-    except Exception:
-        log.warning('HY-MT translation unavailable; using OPUS-MT', exc_info=True)
-        return OfflineTranslator()
+    return LlamaTranslator()

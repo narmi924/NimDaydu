@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { LocalTranslator, TranslationQueue, finalTranslation, serviceTranslate } from './translation';
+import { TranslationQueue, finalTranslation, serviceTranslate } from './translation';
 import type { Caption } from './types';
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 const caption = (id: string, final = true): Caption => ({ sessionId: 'one', id, revision: 1, final, text: `Complete sentence ${id}.`, start: 0, end: 1 });
@@ -16,7 +16,7 @@ it('only translates finalized sentences once and delivers them in reading order'
   expect(deliver.mock.calls.map(call => call[0].id)).toEqual(['a', 'b']);
 });
 
-it('drops an in-flight translation after changing session or provider', async () => {
+it('drops an in-flight translation after changing session', async () => {
   vi.useFakeTimers();
   let resolve!: (text: string) => void;
   const translate = vi.fn(() => new Promise<string>(done => { resolve = done; }));
@@ -113,48 +113,6 @@ it('cancels a hung old session immediately and starts the next without waiting f
   expect(queue.status.pending).toBe(0);
 });
 
-it('destroys a timed-out Chrome instance and recreates it for the next attempt', async () => {
-  vi.useFakeTimers();
-  const broken = { translate: vi.fn(() => new Promise<string>(() => {})), destroy: vi.fn() };
-  const working = { translate: vi.fn(async () => '恢复后的完整译文'), destroy: vi.fn() };
-  const create = vi.fn().mockResolvedValueOnce(broken).mockResolvedValueOnce(working);
-  vi.stubGlobal('window', { Translator: { availability: async () => 'available', create } });
-  const translator = new LocalTranslator();
-  await translator.prepare(() => {});
-  const result = translator.translate('Public synthetic sentence.').catch(error => error.name);
-  await vi.advanceTimersByTimeAsync(8001);
-  expect(await result).toBe('TimeoutError');
-  expect(broken.destroy).toHaveBeenCalledOnce(); expect(translator.ready).toBe(false);
-  expect(await translator.translate('Public synthetic sentence.')).toBe('恢复后的完整译文');
-  expect(create).toHaveBeenCalledTimes(2);
-  translator.destroy(); expect(working.destroy).toHaveBeenCalledOnce();
-});
-
-it('releases a late Chrome creation after the view was closed', async () => {
-  vi.useFakeTimers();
-  let resolve!: (instance: any) => void;
-  const instance = { translate: vi.fn(), destroy: vi.fn() };
-  vi.stubGlobal('window', { Translator: { create: () => new Promise(done => { resolve = done; }) } });
-  const translator = new LocalTranslator();
-  const result = translator.prepare(() => {}).catch(error => error.name);
-  translator.destroy(); expect(await result).toBe('AbortError');
-  resolve(instance); await vi.advanceTimersByTimeAsync(0);
-  expect(instance.destroy).toHaveBeenCalledOnce(); expect(translator.ready).toBe(false);
-});
-
-it('clears creation timeout once prepared, so an established translator stays usable after three minutes', async () => {
-  vi.useFakeTimers();
-  let createSignal!: AbortSignal;
-  vi.stubGlobal('window', { Translator: { create: async ({ signal }: any) => {
-    createSignal = signal; return { translate: async () => '完成', destroy() {} };
-  } } });
-  const translator = new LocalTranslator(); await translator.prepare(() => {});
-  await vi.advanceTimersByTimeAsync(180001);
-  expect(createSignal.aborted).toBe(false);
-  expect(await translator.translate('Synthetic sentence.')).toBe('完成');
-  translator.destroy();
-});
-
 it('retries an unacknowledged delivery using the completed result instead of calling the model again', async () => {
   vi.useFakeTimers();
   const translate = vi.fn(async () => '已完成的译文');
@@ -166,13 +124,13 @@ it('retries an unacknowledged delivery using the completed result instead of cal
   expect(queue.status.pending).toBe(0);
 });
 
-it('sends recent sentences as context to the local model and explains a missing model', async () => {
+it('uses the local translation service and explains a missing model', async () => {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ text: '好的。' }), { status: 200 }));
   vi.stubGlobal('fetch', fetchMock);
-  await expect(serviceTranslate('Okay.', 'token', ['Earlier.'], 'offline')).resolves.toBe('好的。');
-  expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toEqual({ text: 'Okay.', context: ['Earlier.'], provider: 'offline' });
+  await expect(serviceTranslate('Okay.', 'token')).resolves.toBe('好的。');
+  expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toEqual({ text: 'Okay.' });
   fetchMock.mockResolvedValueOnce(new Response('{}', { status: 503 }));
-  await expect(serviceTranslate('Okay.', 'token', [], 'offline')).rejects.toThrow(/setup\.(ps1|sh)/);
+  await expect(serviceTranslate('Okay.', 'token')).rejects.toThrow(/setup\.(ps1|sh)/);
   fetchMock.mockResolvedValueOnce(new Response('{}', { status: 502 }));
-  await expect(serviceTranslate('Okay.', 'token', [], 'offline')).rejects.toThrow('自动重试');
+  await expect(serviceTranslate('Okay.', 'token')).rejects.toThrow('自动重试');
 });

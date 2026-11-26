@@ -1,6 +1,6 @@
 export const SERVICE = 'http://127.0.0.1:8765';
 export const SOCKET = 'ws://127.0.0.1:8765/audio';
-export type TranslationMode = 'offline' | 'local' | 'deepseek' | 'off';
+export type TranslationMode = 'offline' | 'off';
 export type ViewMode = 'bilingual' | 'original' | 'translated';
 export type Source = { tabId: number; title: string; windowId: number; site?: string; host?: string };
 export type Caption = {
@@ -26,11 +26,12 @@ export type Snapshot = { state: CaptureState; captions: Caption[]; preview?: Eng
 export type OverlayMode = 'fullscreen' | 'always' | 'off';
 export type Settings = { schema: number; token: string; translationMode: TranslationMode; viewMode: ViewMode; fontSize: number; sentenceHold: number; autoSave: boolean; overlay: OverlayMode };
 export const DEFAULT_SETTINGS: Settings = { schema: 3, token: '', translationMode: 'offline', viewMode: 'bilingual', fontSize: 18, sentenceHold: 0.4, autoSave: true, overlay: 'fullscreen' };
-export function readSettings(saved?: Partial<Settings>): Settings {
-  if (saved?.schema === 3) return { ...DEFAULT_SETTINGS, ...saved };
+export function readSettings(saved?: Partial<Omit<Settings, 'translationMode'>> & { translationMode?: string }): Settings {
+  const translationMode = saved?.translationMode === 'off' ? 'off' : 'offline';
+  if (saved?.schema === 3) return { ...DEFAULT_SETTINGS, ...saved, translationMode };
   // v0.5 users never chose 0.8 s; it was the old default. Shorter waits now
   // pair with clause-sized captions, so move them to the new default.
-  if (saved?.schema === 2) return { ...DEFAULT_SETTINGS, ...saved, schema: 3, sentenceHold: saved.sentenceHold === 0.8 || saved.sentenceHold === undefined ? DEFAULT_SETTINGS.sentenceHold : saved.sentenceHold };
+  if (saved?.schema === 2) return { ...DEFAULT_SETTINGS, ...saved, translationMode, schema: 3, sentenceHold: saved.sentenceHold === 0.8 || saved.sentenceHold === undefined ? DEFAULT_SETTINGS.sentenceHold : saved.sentenceHold };
   return { ...DEFAULT_SETTINGS, token: saved?.token || '' };
 }
 export const isActive = (phase: Phase) => ['starting', 'capturing', 'paused', 'stopping'].includes(phase);

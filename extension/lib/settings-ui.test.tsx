@@ -15,16 +15,17 @@ vi.mock('./connection', () => ({ connectLocal: async () => ({ ready: true, model
   outputDirectory: 'E:\\Projects\\UniBuni\\Nimdaydu\\OUTPUTS' }) }));
 afterEach(() => vi.unstubAllGlobals());
 
-it('shows saving on for existing users, preserves the provider and remembers the switch after reopening settings', async () => {
+it('shows saving on for existing users, moves removed translation modes to the local model and remembers the switch after reopening settings', async () => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   const host = document.createElement('div'); document.body.append(host);
   let root = createRoot(host);
   await act(async () => root.render(<App/>));
+  expect([...host.querySelectorAll('#provider option')].map(option => (option as HTMLOptionElement).value)).toEqual(['offline', 'off']);
   const control = host.querySelector<HTMLInputElement>('#auto-save')!;
   expect(control.checked).toBe(true);
   expect(host.textContent).toContain('E:\\Projects\\UniBuni\\Nimdaydu\\OUTPUTS');
   await act(async () => control.click());
-  expect(mock.set).toHaveBeenLastCalledWith({ settings: expect.objectContaining({ autoSave: false, translationMode: 'local' }) });
+  expect(mock.set).toHaveBeenLastCalledWith({ settings: expect.objectContaining({ autoSave: false, translationMode: 'offline' }) });
   await act(async () => root.unmount());
   root = createRoot(host); await act(async () => root.render(<App/>));
   expect(host.querySelector<HTMLInputElement>('#auto-save')!.checked).toBe(false);

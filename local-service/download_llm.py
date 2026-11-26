@@ -1,5 +1,4 @@
 """Install the local translation model and a pinned llama.cpp server for this platform."""
-import argparse
 import hashlib
 import json
 import platform
@@ -19,15 +18,8 @@ SERVERS = {
     ('win32', 'AMD64'): (f'llama-{BUILD}-bin-win-vulkan-x64.zip', '571794ccf8d44351253a644cfc406bcf094cf01e902aad7f6f65e8a0859eb0af', 'llama-server.exe'),
     ('darwin', 'arm64'): (f'llama-{BUILD}-bin-macos-arm64.tar.gz', 'e4219b1442dcf0b68e860ea6f06d417163326391e8514b04019080f2444ff47c', 'llama-server'),
 }
-MODELS = {
-    'hy-mt1.5-1.8b-q4': ('HY-MT1.5-1.8B', 'tencent/HY-MT1.5-1.8B-GGUF', 'HY-MT1.5-1.8B-Q4_K_M.gguf',
-                         '4383ac0c3c8e476de98ff979c2a3f069f8c4fb385e7860cf2d28da896cc477c7'),
-    'hy-mt1.5-7b-q4': ('HY-MT1.5-7B', 'tencent/HY-MT1.5-7B-GGUF', 'HY-MT1.5-7B-Q4_K_M.gguf',
-                       'fc87637e4dd29547811a28170770c2ac17725fb7690b7c4aafa4f463c3e77568'),
-}
-# docs/dev/benchmarks.md (v0.6): Q8 scored no better than Q4 at twice the latency;
-# 7B gains about one COMET point for 3.5 GB more memory and 3x the latency.
-DEFAULT_MODEL = 'hy-mt1.5-1.8b-q4'
+MODEL = ('Hy-MT2-1.8B', 'tencent/Hy-MT2-1.8B-GGUF', 'Hy-MT2-1.8B-Q4_K_M.gguf',
+         'dc5f44fcf1fa496ee7ad725982c0c8c553a4de00259b53af84c4b89fb0c06699')
 
 
 def download(url, destination, sha256):
@@ -66,7 +58,7 @@ def digest(path):
 def install_server(tools):
     key = (sys.platform, platform.machine())
     if key not in SERVERS:
-        raise RuntimeError(f'No tested llama.cpp build for {key}; the basic offline translator stays available.')
+        raise RuntimeError(f'No tested llama.cpp build for {key}.')
     archive_name, sha256, executable = SERVERS[key]
     downloads = tools / 'downloads'
     downloads.mkdir(parents=True, exist_ok=True)
@@ -95,18 +87,15 @@ def install_server(tools):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', choices=MODELS, default=DEFAULT_MODEL)
-    args = parser.parse_args()
     tools = ROOT / '.tools'
     server = install_server(tools)
-    name, repository, filename, sha256 = MODELS[args.model]
+    name, repository, filename, sha256 = MODEL
     directory = ROOT / 'models/llm'
     directory.mkdir(parents=True, exist_ok=True)
     download(f'https://huggingface.co/{repository}/resolve/main/{filename}', directory / filename, sha256)
-    manifest = {'name': name, 'key': args.model, 'profile': 'hy-mt', 'model': (directory / filename).relative_to(ROOT).as_posix(),
+    manifest = {'name': name, 'key': 'hy-mt2-1.8b-q4', 'profile': 'hy-mt', 'model': (directory / filename).relative_to(ROOT).as_posix(),
                 'sha256': sha256, 'server': server, 'build': BUILD,
-                'license': 'Tencent HY Community License (not licensed in the EU, UK or South Korea)'}
+                'license': 'Apache-2.0'}
     (directory / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     print(f'Local translation ready: {name} ({filename}) with llama.cpp {BUILD}.', flush=True)
 

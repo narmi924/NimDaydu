@@ -4,8 +4,17 @@ import { applyTranslation, mergeCaption, mergePreview, readSettings, type Captio
 const base: Caption = { sessionId: 'session', id: 'line', revision: 1, text: 'Open the form', final: false, start: 0, end: 1 };
 
 it('enables saving for existing settings while preserving an explicit opt-out', () => {
-  expect(readSettings({ schema: 2, translationMode: 'local' })).toMatchObject({ autoSave: true, translationMode: 'local' });
+  expect(readSettings({ schema: 2, translationMode: 'local' })).toMatchObject({ autoSave: true, translationMode: 'offline' });
   expect(readSettings({ schema: 2, autoSave: false }).autoSave).toBe(false);
+});
+
+it('moves removed translation modes to the local model without losing preferences', () => {
+  for (const schema of [2, 3]) for (const translationMode of ['local', 'deepseek']) {
+    expect(readSettings({ schema, translationMode, fontSize: 22, autoSave: false })).toMatchObject({
+      translationMode: 'offline', fontSize: 22, autoSave: false,
+    });
+  }
+  expect(readSettings({ schema: 3, translationMode: 'off' }).translationMode).toBe('off');
 });
 
 it('moves the old default translation wait to the faster one but keeps a deliberate choice', () => {

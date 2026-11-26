@@ -97,7 +97,7 @@
 |---|---|
 | 安装时提示需要 Apple 芯片或 macOS 15 | 这个版本只支持 M 系列芯片和 macOS 15 及以上 |
 | 启动后提示“服务已退出” | 查看 NimDaydu 文件夹里的 `.nimdaydu/service.err.log`。按 Command + Shift + . 可以显示隐藏文件夹 |
-| 设置页显示翻译模型是 OPUS-MT | 说明 HY-MT 没有启动成功。重新运行 `bash setup.sh`。日志在 `.nimdaydu/translator.log` |
+| 提示本机翻译模型未就绪 | 重新运行 `bash setup.sh` 并重启本机服务。日志在 `.nimdaydu/translator.log` |
 | 提示“语音识别持续积压” | 关闭其他占用 CPU 很多的程序，然后重新开始 |
 | Chrome 提示无法连接本机服务 | 先双击 Start-NimDaydu.command，等它显示“已就绪” |
 

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { browser } from 'wxt/browser';
 import { applyTranslation, draftKey, isActive, mergeCaption, mergePreview, readSettings, DEFAULT_SETTINGS, timestamp,
   type Caption, type CaptureState, type DraftTranslations, type EnglishPreview, type Settings, type Source } from '../../lib/types';
-import { LocalTranslator, TranslationQueue, type TranslationStatus } from '../../lib/translation';
+import type { TranslationStatus } from '../../lib/translation';
 import { connectLocal, type Connection } from '../../lib/connection';
 import { IS_MAC, SETUP_SCRIPT } from '../../lib/platform';
 import { readableCaptions, groupParagraphs, previewUnits } from '../../lib/reader';
@@ -34,45 +34,18 @@ export default function App() {
   const [following, setFollowing] = useState(true);
   const [elapsed, setElapsed] = useState(0);
   const settingsRef = useRef(settings);
-  const captionsRef = useRef(captions);
   const stateRef = useRef(state);
   const connectionRef = useRef(connection);
-  const ownerRef = useRef(false);
-  const viewId = useRef(crypto.randomUUID());
   const scrollRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const translatorRef = useRef<LocalTranslator | null>(null);
-  const queueRef = useRef<TranslationQueue | null>(null);
-  settingsRef.current = settings; captionsRef.current = captions; stateRef.current = state;
+  settingsRef.current = settings; stateRef.current = state;
   connectionRef.current = connection;
-  translatorRef.current ??= new LocalTranslator();
 
   const sendOffscreen = useCallback((message: Record<string, unknown>) => browser.runtime.sendMessage({ target: 'offscreen', ...message }), []);
-  // The capture page translates with the local model or DeepSeek, so Chinese
-  // keeps coming while this panel is hidden. Only Chrome's own translator has
-  // to run in a visible page, which makes this panel its owner.
-  const canTranslate = useCallback(() => settingsRef.current.translationMode === 'local' && Boolean(window.Translator), []);
-  const viewTranslates = () => settingsRef.current.translationMode === 'local';
-
-  if (!queueRef.current) queueRef.current = new TranslationQueue(async (caption, signal) => {
-    if (settingsRef.current.translationMode !== 'local') throw new Error('翻译由采音页面处理');
-    return translatorRef.current!.translate(caption.text, signal);
-  }, async (caption, text) => {
-    const result = await sendOffscreen({ type: 'translation', viewId: viewId.current, sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text });
-    if (!result?.ok) throw new Error('字幕视图已切换，译文等待重新投递。');
-  }, () => {}, { onChange: status => {
-    if (!viewTranslates()) return;
-    setTranslationStatus(status); setTranslationFailed(status.failed > 0);
-  } });
   const showServiceStatus = useCallback((status?: TranslationStatus) => {
-    if (viewTranslates() || !status) return;
+    if (!status) return;
     setTranslationStatus(status); setTranslationFailed(status.failed > 0);
   }, []);
-
-  const queueCaption = useCallback((caption: Caption) => {
-    if (!ownerRef.current || !canTranslate() || caption.translationRevision === caption.revision) return;
-    queueRef.current!.enqueue(caption);
-  }, [canTranslate]);
 
   const connect = useCallback(async () => {
     try {
@@ -99,7 +72,7 @@ export default function App() {
       else if (message.type === 'state') {
         const next: CaptureState = message.state;
         if (next.phase === 'starting') {
-          setCaptions([]); setPreview(undefined); setDrafts({}); queueRef.current!.reset(); setFollowing(true);
+          setCaptions([]); setPreview(undefined); setDrafts({}); setFollowing(true);
           setTranslationFailed(false);
         }
         stateRef.current = next; setState(next);
@@ -107,28 +80,20 @@ export default function App() {
         if (message.caption.sessionId !== stateRef.current.sessionId) return;
         setCaptions(previous => mergeCaption(previous, message.caption));
         if (message.preview) setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
-        queueCaption(message.caption);
       } else if (message.type === 'preview' && message.preview) {
         setPreview(previous => mergePreview(previous, message.preview, stateRef.current.sessionId));
       } else if (message.type === 'translation') setCaptions(previous => applyTranslation(previous, message));
       else if (message.type === 'translationStatus') showServiceStatus(message.status);
       else if (message.type === 'draft' && message.sessionId === stateRef.current.sessionId) setDrafts(previous => ({ ...previous, [message.key]: message.text }));
-      else if (message.type === 'cleared') { setCaptions([]); setPreview(undefined); setDrafts({}); queueRef.current!.reset(); }
+      else if (message.type === 'cleared') { setCaptions([]); setPreview(undefined); setDrafts({}); }
     };
     const storageListener = (changes: any, area: string) => {
       if (area !== 'local' || !changes.settings?.newValue) return;
       const next = readSettings(changes.settings.newValue);
       if (next.translationMode !== settingsRef.current.translationMode || next.token !== settingsRef.current.token) {
-        queueRef.current!.reset(); ownerRef.current = false;
-        translatorRef.current!.destroy(); setTranslationFailed(false); setNotice('');
+        setTranslationFailed(false); setNotice('');
         setTranslationStatus({ pending: 0, failed: 0, retrying: 0, running: false });
         void connect();
-        if (next.translationMode === 'local' && !translatorRef.current!.ready) {
-          void translatorRef.current!.availability().then(availability => {
-            if (availability === 'available') return translatorRef.current!.prepare(() => {});
-            setNotice('Chrome 语言包尚未就绪。可在设置中准备，或改用本机模型 HY-MT。');
-          }).catch(() => setNotice('Chrome 内置翻译不可用，请在设置中改用本机模型 HY-MT。'));
-        }
       }
       settingsRef.current = next; setSettings(next);
     };
@@ -146,26 +111,15 @@ export default function App() {
       setSource(selection?.source);
       if (snapshot?.state) { stateRef.current = snapshot.state; setState(snapshot.state); setCaptions(snapshot.captions || []); setPreview(snapshot.preview); setDrafts(snapshot.drafts || {}); showServiceStatus(snapshot.translationStatus); }
       await connect();
-      if (initial.translationMode === 'local' && await translatorRef.current!.availability() === 'available') {
-        await translatorRef.current!.prepare(() => {});
-      }
     })().catch(() => { if (mounted) { setChecking(false); setConnectionError('请重新打开侧栏。'); } });
 
-    const lease = setInterval(() => {
-      void sendOffscreen({ type: 'lease', viewId: viewId.current, canTranslate: canTranslate() }).then(result => {
-        const becameOwner = !ownerRef.current && result?.owner;
-        if (ownerRef.current && !result?.owner) queueRef.current!.reset();
-        ownerRef.current = Boolean(result?.owner);
-        if (becameOwner) captionsRef.current.forEach(queueCaption);
-      }).catch(() => {});
-    }, 2000);
+    const lease = setInterval(() => { void sendOffscreen({ type: 'lease' }).catch(() => {}); }, 2000);
     const retry = setInterval(() => { if (!connectionRef.current && !isActive(stateRef.current.phase)) void connect(); }, 10000);
     return () => {
       mounted = false; clearInterval(lease); clearInterval(retry);
       browser.runtime.onMessage.removeListener(listener); browser.storage.onChanged.removeListener(storageListener);
-      queueRef.current!.reset(); translatorRef.current?.destroy();
     };
-  }, [canTranslate, connect, queueCaption, sendOffscreen, showServiceStatus]);
+  }, [connect, sendOffscreen, showServiceStatus]);
 
   useEffect(() => {
     const update = () => setElapsed(state.startedAt ? (Date.now() - state.startedAt) / 1000 : 0);
@@ -188,19 +142,14 @@ export default function App() {
   }, [menu]);
 
   async function start() {
-    const localPreparation = settingsRef.current.translationMode === 'local'
-      ? translatorRef.current!.prepare(() => {}) : Promise.resolve();
     setWorking(true); setNotice(''); setTranslationFailed(false);
     try {
-      await localPreparation;
       const next = await connect();
       if (!next) return;
       const mode = settingsRef.current.translationMode;
       if (mode === 'offline' && !next.offlineTranslationReady) throw new Error(`本机翻译模型未就绪，请重新运行 ${SETUP_SCRIPT}，然后重启本机服务。`);
-      if (mode === 'deepseek' && !next.deepseekConfigured) throw new Error('DeepSeek 尚未配置，请在设置中检查。');
-      ownerRef.current = canTranslate();
       const result = await browser.runtime.sendMessage({ target: 'background', type: 'start', token: next.token,
-        viewId: viewId.current, canTranslate: ownerRef.current, sentenceHold: settingsRef.current.sentenceHold });
+        sentenceHold: settingsRef.current.sentenceHold });
       if (result?.error) setNotice(result.error);
     } catch (error) { setNotice(error instanceof Error ? error.message : '启动失败。'); }
     finally { setWorking(false); }
@@ -222,15 +171,9 @@ export default function App() {
     setRepairing(true); setNotice('');
     // Retain successful captions and the audio session. Only repair this queue.
     try {
-      if (settingsRef.current.translationMode === 'local') {
-        await translatorRef.current!.prepare(() => {});
-        queueRef.current!.retryFailed();
-        captionsRef.current.forEach(queueCaption);
-      } else {
-        await connect();
-        await sendOffscreen({ type: 'retryTranslation' });
-      }
-    } catch { setNotice('翻译暂未恢复，请在设置中检查语言包或本机连接。英文字幕仍保留。'); }
+      await connect();
+      await sendOffscreen({ type: 'retryTranslation' });
+    } catch { setNotice('翻译暂未恢复，请在设置中检查本机模型和连接。英文字幕仍保留。'); }
     finally { setRepairing(false); }
   }
 

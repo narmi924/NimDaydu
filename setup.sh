@@ -62,7 +62,6 @@ draft="$selected"; [ "$draft" = hybrid ] && draft=small
 if [ "$selected" = hybrid ]; then
   "$PY" download_refiner.py || fail '整句复核模型下载失败。'
 fi
-"$PY" download_translation.py || fail '备用离线翻译模型下载失败。'
 "$PY" download_llm.py || fail '本机翻译模型下载失败。'
 
 cd "$PROJECT/extension"

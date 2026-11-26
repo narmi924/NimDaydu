@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { browser } from 'wxt/browser';
 import { DEFAULT_SETTINGS, SERVICE, readSettings, type OverlayMode, type Settings, type TranslationMode, type ViewMode } from '../../lib/types';
 import { connectLocal, type Connection } from '../../lib/connection';
-import { LocalTranslator } from '../../lib/translation';
 import { IS_MAC, SETUP_SCRIPT, START_SCRIPT } from '../../lib/platform';
 
 export default function App() {
@@ -11,14 +10,9 @@ export default function App() {
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState('');
-  const [key, setKey] = useState('');
-  const [savingKey, setSavingKey] = useState(false);
-  const [languageStatus, setLanguageStatus] = useState('');
-  const [preparing, setPreparing] = useState(false);
   const [changingModel, setChangingModel] = useState(false);
   const settingsRef = useRef(settings);
-  const translator = useRef<LocalTranslator | null>(null);
-  settingsRef.current = settings; translator.current ??= new LocalTranslator();
+  settingsRef.current = settings;
 
   const connect = useCallback(async () => {
     setChecking(true); setError('');
@@ -36,35 +30,13 @@ export default function App() {
     void browser.storage.local.get('settings').then(stored => setSettings(readSettings(stored.settings as Partial<Settings> | undefined)));
     const listener = (changes: any, area: string) => { if (area === 'local' && changes.settings?.newValue) setSettings(readSettings(changes.settings.newValue)); };
     browser.storage.onChanged.addListener(listener); void connect();
-    return () => { browser.storage.onChanged.removeListener(listener); translator.current?.destroy(); };
+    return () => { browser.storage.onChanged.removeListener(listener); };
   }, [connect]);
 
   async function save(update: Partial<Settings>) {
     const next = { ...settingsRef.current, ...update };
     settingsRef.current = next; setSettings(next);
     await browser.storage.local.set({ settings: next }); setSaved('已保存');
-  }
-
-  async function saveKey(clear = false) {
-    setSavingKey(true); setError('');
-    try {
-      const current = await connectLocal();
-      const response = await fetch(`${SERVICE}/providers/deepseek`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${current.token}` },
-        body: JSON.stringify(clear ? { clear: true } : { key: key.trim() }), signal: AbortSignal.timeout(5000),
-      });
-      if (!response.ok) throw new Error('密钥保存失败，请重启本机服务后重试。');
-      setKey(''); await connect(); setSaved(clear ? '已移除密钥' : '密钥已保存在本机');
-    } catch (error) { setError(error instanceof Error ? error.message : '保存失败。'); }
-    finally { setSavingKey(false); }
-  }
-
-  function prepareChrome() {
-    setPreparing(true); setError(''); setLanguageStatus('正在准备语言包…');
-    void translator.current!.prepare(value => setLanguageStatus(`正在下载 ${Math.round(value * 100)}%`))
-      .then(() => setLanguageStatus('语言包已就绪'))
-      .catch(error => { setError(error instanceof Error && error.name !== 'TimeoutError' ? error.message : '语言包准备超时。可以改用本机模型 HY-MT。'); setLanguageStatus(''); })
-      .finally(() => setPreparing(false));
   }
 
   async function changeModel(model: string) {
@@ -82,7 +54,6 @@ export default function App() {
     finally { setChangingModel(false); }
   }
 
-  const fallbackTranslator = connection?.offlineTranslationReady && connection.translationEngine === 'OPUS-MT';
   const shortcut = IS_MAC ? 'Option+Shift+O' : 'Alt+Shift+O';
 
   return <main className="settings-page">
@@ -93,16 +64,10 @@ export default function App() {
     <section className="settings-section" aria-labelledby="translation-heading">
       <h2 id="translation-heading">翻译</h2>
       <div className="setting-row"><label htmlFor="provider">翻译方式</label><select id="provider" value={settings.translationMode} onChange={e => void save({ translationMode: e.target.value as TranslationMode, viewMode: e.target.value === 'off' ? 'original' : settings.viewMode === 'original' ? 'bilingual' : settings.viewMode })}>
-        <option value="offline">本机模型 HY-MT（推荐）</option>
-        <option value="local">Chrome 内置翻译</option>
-        <option value="deepseek">DeepSeek（联网）</option>
+        <option value="offline">本机模型 Hy-MT2-1.8B</option>
         <option value="off">不翻译</option>
       </select></div>
-      {settings.translationMode === 'offline' && (fallbackTranslator
-        ? <div className="notice" role="status"><p>HY-MT 没有启动成功，现在用的是质量较低的备用模型 OPUS-MT。请重新运行 {SETUP_SCRIPT}，或查看项目里的 .nimdaydu/translator.log。</p></div>
-        : <p className="section-note">在这台电脑上翻译，不需要网络或密钥，音频和文字都不会上传。{connection?.translationEngine ? `当前模型：${connection.translationEngine}。` : ''}</p>)}
-      {settings.translationMode === 'local' && <div className="provider-detail"><p>使用 Chrome 自带的翻译，需要先下载语言包。这种方式只能在侧栏打开时翻译；全屏或关闭侧栏后，中文会暂停。</p><div className="language-preparation"><button className="button" disabled={preparing} onClick={prepareChrome}>{preparing ? '准备中…' : '准备语言包'}</button><span role="status">{languageStatus}</span></div></div>}
-      {settings.translationMode === 'deepseek' && <div className="provider-detail"><p>每句英文和前两句一起发送给 DeepSeek，不发送音频。按你自己的 API 用量计费。</p><label htmlFor="api-key">API 密钥 {connection?.deepseekConfigured && <span className="configured">已配置</span>}</label><div className="key-row"><input id="api-key" type="password" autoComplete="off" placeholder="sk-…" value={key} onChange={e => setKey(e.target.value)}/><button className="button" disabled={savingKey || !key.trim()} onClick={() => void saveKey()}>保存</button></div><p className="section-note">密钥只保存在这台电脑的本机服务里。模型：{connection?.deepseekModel || 'deepseek-flash'}。</p>{connection?.deepseekConfigured && <button className="text-button" disabled={savingKey} onClick={() => void saveKey(true)}>移除已保存的密钥</button>}</div>}
+      {settings.translationMode === 'offline' && <p className="section-note">在这台电脑上翻译，不需要网络或密钥，音频和文字都不会上传。{connection?.translationEngine ? `当前模型：${connection.translationEngine}。` : ''}</p>}
     </section>
 
     <section className="settings-section" aria-labelledby="display-heading">

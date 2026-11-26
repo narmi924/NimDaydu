@@ -83,8 +83,8 @@ it('starts translating in the capture page and puts floating captions on the sou
   expect(await command('start')).toEqual({ ok: true });
   expect(mock.send.mock.calls.find(([message]) => message.type === 'start')![0]).toMatchObject({ translationMode: 'offline' });
   await vi.waitFor(() => expect(mock.inject).toHaveBeenCalledWith({ target: { tabId: 1 }, files: ['/content-scripts/overlay.js'] }));
-  mock.storageListener({ settings: { oldValue: mock.settings, newValue: { ...mock.settings, translationMode: 'deepseek' } } }, 'local');
-  expect(mock.send).toHaveBeenLastCalledWith({ target: 'offscreen', type: 'settings', translationMode: 'deepseek' });
+  mock.storageListener({ settings: { oldValue: mock.settings, newValue: { ...mock.settings, translationMode: 'off' } } }, 'local');
+  expect(mock.send).toHaveBeenLastCalledWith({ target: 'offscreen', type: 'settings', translationMode: 'off' });
 });
 
 it('shows floating captions on a fresh page and toggles them where they already run', async () => {
