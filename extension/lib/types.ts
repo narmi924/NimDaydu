@@ -20,7 +20,7 @@ export type CaptureState = {
   saveError?: string;
 };
 /** Live English, already cut into the rows its settled captions will take (`units`). */
-export type EnglishPreview = { sessionId: string; revision: number; text: string; start: number; end: number; units?: string[] };
+export type EnglishPreview = { sessionId: string; revision: number; text: string; start: number; end: number; units?: string[]; speechEnded?: boolean };
 export type Snapshot = { state: CaptureState; captions: Caption[]; preview?: EnglishPreview };
 /** Floating captions on the page: only while it is fullscreen, always, or never. */
 export type OverlayMode = 'fullscreen' | 'always' | 'off';

@@ -14,9 +14,6 @@ STANDALONE = {'yes', 'no', 'okay', 'ok', 'thanks', 'thank you', 'sure', 'right',
 MONTHS = r'(?:january|february|march|april|may|june|july|august|september|october|november|december)'
 # Subtitle-sized units: about two short lines. Longer sentences are cut at
 # clause boundaries so each part is translated and shown as soon as possible.
-MAX_UNIT_WORDS = 16
-UNIT_TARGET_WORDS = 8
-MIN_UNIT_WORDS = 5
 CLAUSE_BOUNDARY = re.compile(r'(?<=[,;:])\s+|\s+(?=(?:and|but|so|because|which|when|while|if|then|or|although|though|whereas)\b)', re.I)
 
 
@@ -30,6 +27,8 @@ def words(text):
 
 def weak(text):
     bare = text.lower().strip(' .,!?:;')
+    if re.search(r"\b(?:not|never|\w+n['’]t)\s*$", text, re.I):
+        return True
     return bare in PREFIXES or (len(words(text)) < 3 and bare not in STANDALONE) or bool(re.search(r'\b(?:and|but|because|the|a|an|to|of|with|will|would|can|could|is|are|was|were)\W*$', text, re.I)) or bool(re.search(r'\b(?:Mr|Mrs|Dr|Prof|e\.g|i\.e)\.$', text, re.I))
 
 
@@ -61,12 +60,14 @@ def split_units(text):
     still being spoken gives the same cuts: rows already shown stay put while
     words arrive, and the settled caption lands where its draft was.
     """
-    if len(words(text)) <= MAX_UNIT_WORDS:
-        return [text]
     pieces, start = [], 0
     for boundary in CLAUSE_BOUNDARY.finditer(text):
         left, rest = text[start:boundary.start()], text[boundary.end():]
-        if len(words(left)) >= UNIT_TARGET_WORDS and len(words(rest)) >= MIN_UNIT_WORDS:
+        strong = left.endswith((',', ';', ':')) or re.match(r'(?:but|because|although|whereas)\b', rest, re.I)
+        # Give the next clause room to start. Two-word tails such as "and again"
+        # belong with the preceding phrase. Uniform lookahead keeps cuts stable.
+        if (len(words(left)) >= (8 if strong else 10) and len(words(rest)) >= 3
+                and not weak(left) and not date_continuation(left, rest)):
             pieces.append(left)
             start = boundary.end()
     pieces.append(text[start:])
@@ -106,7 +107,7 @@ class SentenceAssembler:
         self.last_end = None
         self.pending = False
         self.preview_revision = 0
-        self.last_preview = ('', 0, 0)
+        self.last_preview = ('', 0, 0, False)
 
     def _preview_snapshot(self):
         lines = list(self.lines.values())
@@ -118,14 +119,15 @@ class SentenceAssembler:
             else:
                 text = (text + ' ' + line['text']).strip()
             previous = line
-        value = (text, lines[0]['start'] if lines else 0, lines[-1]['end'] if lines else 0)
+        ended = bool(lines and (lines[-1]['final'] or lines[-1].get('speechEnded')) and not weak(lines[-1]['text']))
+        value = (text, lines[0]['start'] if lines else 0, lines[-1]['end'] if lines else 0, ended)
         if value != self.last_preview:
             self.preview_revision += 1
             self.last_preview = value
         # Already cut like settled captions, so the live rows do not reflow
         # from one long paragraph into sentences when the final arrives.
         return {'revision': self.preview_revision, 'text': value[0], 'units': display_units(value[0]),
-                'start': value[1], 'end': value[2]}
+                'start': value[1], 'end': value[2], 'speechEnded': ended}
 
     def _publish_preview(self):
         previous_revision = self.preview_revision
@@ -237,6 +239,7 @@ class SentenceAssembler:
             self.lines.pop(line['id'], None)
             self.committed.add(line['id'])
         units = split_units(text)
+        latest = max(group, key=lambda line: line['_received'])
         total = sum(len(unit) for unit in units)
         duration = max(0, last['end'] - first['start'])
         offset = 0
@@ -251,6 +254,10 @@ class SentenceAssembler:
                        'incomplete': incomplete and final_unit, 'continued': not final_unit,
                        'rawText': [line['text'] for line in group] if index == 0 else [],
                        'inferenceMs': max(line.get('inferenceMs', 0) for line in group)}
+            # A joined caption waits for the last contributing acoustic pass to arrive.
+            for key in ('refineMs', 'refineQueueMs'):
+                if key in latest:
+                    message[key] = latest[key]
             offset += len(unit)
             if final_unit:
                 message['preview'] = self._preview_snapshot()

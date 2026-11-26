@@ -16,7 +16,7 @@ extension/              Chrome 扩展（WXT + React）
 local-service/          本机服务（FastAPI）
   nimdaydu/engine.py               Moonshine 实时草稿（自定义刷新节奏、积压时跳过刷新）
   nimdaydu/refinement.py           Parakeet 整句复核（合并上限 15 秒，重叠词去重）
-  nimdaydu/segmentation.py         成句、按从句切成字幕单元（≤16 词）
+  nimdaydu/segmentation.py         成句、按标点和从句边界分行，保留完整词组
   nimdaydu/translation.py          Hy-MT2-1.8B（llama.cpp 子进程）
   nimdaydu/system.py               平台差异：脚本名、Windows 关闭后台节能降速
 setup.ps1 / start.ps1 / stop.ps1   Windows
@@ -27,11 +27,13 @@ setup.sh / start.sh / stop.sh      macOS（Apple 芯片）
 
 1. 侧栏“开始”经 background 取得 tabCapture 流，offscreen 文档把 48 kHz PCM 发送到 `ws://127.0.0.1:8765/audio`。
 2. 服务端 Moonshine 产生实时英文，Parakeet 复核定稿，`SentenceAssembler` 成句并切成字幕单元（`continued` 表示句子在下一条继续）。
-3. offscreen 收到定稿后，调用本机 Hy-MT2-1.8B 翻译；侧栏隐藏或关闭也不受影响。
+3. offscreen 在本机 Hy-MT2 空闲时先翻已说完的行或稳定的从句。定稿与早译的英文匹配时复用中文，其余定稿优先排队翻译。侧栏隐藏或关闭也不受影响。
 4. offscreen 通过 runtime 消息更新侧栏，通过 `runtime.connect('nimdaydu-overlay')` 端口推送给悬浮字幕；悬浮字幕连接期间也算作打开的视图。
 5. 侧栏和悬浮字幕都关闭约 10 秒后停止采集。
 
 悬浮字幕用 `popover="manual"` 放进顶层，进入/退出全屏时重新 `showPopover()`，因此能盖在全屏元素之上。注入使用 `activeTab` + `scripting`：工具栏点击、快捷键或开始采集时注入，网页刷新后需要再按一次快捷键。
+
+侧栏“导出诊断”的 `capture.events` 按句记录耗时，单位为毫秒。英文定稿时先写 `english_settled`，中文定稿后再写 `caption_timing`。以模型估计的句尾为起点，`previewMs` 是匹配定稿英文的预览出现时间（能匹配时才有），`settledMs` 是英文定稿时间，`firstChineseMs` 和 `finalChineseMs` 是对应中文首次可用和定稿的时间。提前出现记为 0。复核等待和计算分别见 `refineQueueMs`、`refineMs`，定稿翻译等待和模型调用分别见 `translationQueueMs`、`modelMs`。复用早译时定稿的模型耗时为 0。
 
 ## 检查
 

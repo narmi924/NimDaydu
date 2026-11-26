@@ -117,6 +117,26 @@ def test_forced_overlapping_native_regions_are_re_recognized_once_as_a_union():
     engine.close()
 
 
+def test_completed_phrase_can_start_refinement_at_a_pause_without_closing_the_live_stream():
+    spans = []
+    class Refiner:
+        def transcribe(self, samples, rate):
+            spans.append(len(samples))
+            return 'Check all the numbers.'
+    engine = RefinedEngine(draft_factory=Draft, refiner_factory=Refiner)
+    engine.begin(lambda _: None)
+    for index in range(6):
+        engine.audio(AudioFrame(index, 1280 * index, np.full(1280, .003, dtype=np.float32)), 16000)
+    engine.draft.emit({**line(), 'text': 'Check all the numbers', 'end': .48})
+    for index in range(6, 10):
+        assert engine.held is not None
+        engine.audio(AudioFrame(index, 1280 * index, np.zeros(1280, dtype=np.float32)), 16000)
+    assert engine.held is None
+    engine.pause()
+    assert spans == [6 * 1280]
+    engine.close()
+
+
 def test_shifted_tail_cannot_leave_a_stale_preview_blocking_later_sentences():
     from nimdaydu.segmentation import SentenceAssembler
     class Refiner:

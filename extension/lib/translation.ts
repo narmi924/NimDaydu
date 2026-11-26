@@ -25,13 +25,15 @@ export function finalTranslation(text: string, incomplete = false, continued = f
   // Closing quotes may come out as opening ones (“…。“); either way the sentence has ended.
   return /[。！？!?…][”’“‘"」]*$/.test(cleaned) ? cleaned : cleaned + '。';
 }
-export async function serviceTranslate(text: string, token: string, signal?: AbortSignal, draft = false): Promise<string> {
+export async function serviceTranslate(text: string, token: string, signal?: AbortSignal, draft = false,
+  onTiming?: (modelMs: number, queueMs: number) => void): Promise<string> {
   const response = await fetch(`${SERVICE}/translate`, {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify(draft ? { text, draft } : { text }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(22000)]) : AbortSignal.timeout(22000),
   });
   if (!response.ok) throw new Error(response.status === 503 ? `本机翻译模型未就绪，请运行 ${SETUP_SCRIPT} 并重启服务。` : '本机翻译暂时失败，稍后自动重试。');
   const result = await response.json();
+  if (Number.isFinite(result.modelMs) && Number.isFinite(result.queueMs)) onTiming?.(result.modelMs, result.queueMs);
   return result.text;
 }
 

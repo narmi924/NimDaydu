@@ -150,7 +150,9 @@ def test_local_translation_requires_authentication_and_uses_selected_model(servi
     assert client.post('/translate', json={'text': 'Hello'}).status_code == 401
     result = client.post('/translate', headers={'Authorization': f'Bearer {token}'},
                          json={'text': 'Hello Discord'})
-    assert result.json() == {'text': '你好，Discord。', 'engine': 'Fake-MT'}
+    body = result.json()
+    assert (body['text'], body['engine']) == ('你好，Discord。', 'Fake-MT')
+    assert body['modelMs'] >= 0 and body['queueMs'] >= 0
     assert client.get('/health').json()['translationEngine'] == 'Fake-MT'
     assert client.post('/translate', headers={'Authorization': f'Bearer {token}'},
                        json={'text': 'Hello', 'provider': 'deepseek'}).status_code == 422
@@ -184,7 +186,7 @@ def test_autosave_api_preserves_late_chinese_and_requires_origin_and_token(servi
         ws.send_bytes(frame()); receive_kind(ws, 'preview')
         ws.send_json({'type': 'stop'}); caption = receive_kind(ws, 'caption'); receive_kind(ws, 'state')
     file = next(directory.rglob('session.json'))
-    assert json.loads(file.read_text())['captions'][0]['text'] == caption['text']
+    assert json.loads(file.read_text(encoding='utf-8'))['captions'][0]['text'] == caption['text']
     endpoint = f'/outputs/{key}/translations'
     payload = {'updates': [{'id': caption['id'], 'revision': caption['revision'], 'text': '完整译文。'}]}
     assert client.post(endpoint, json=payload).status_code == 403

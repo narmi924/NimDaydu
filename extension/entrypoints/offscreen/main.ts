@@ -1,5 +1,5 @@
 import { browser } from 'wxt/browser';
-import { diagnosticSnapshot, recordDiagnostic } from '../../lib/diagnostics';
+import { diagnosticSnapshot, recordDiagnostic, type DiagnosticEvent } from '../../lib/diagnostics';
 import { applyTranslation, DEFAULT_SETTINGS, draftKey, isActive, mergeCaption, mergePreview, SOCKET, type Caption, type CaptureState, type DraftTranslations, type EnglishPreview, type Source, type TranslationMode } from '../../lib/types';
 import { previewUnits } from '../../lib/reader';
 import { OutputSync } from '../../lib/output-sync';
@@ -40,14 +40,52 @@ let translationMode: TranslationMode = DEFAULT_SETTINGS.translationMode;
 let serviceToken = '';
 let translationStatus: TranslationStatus = { pending: 0, failed: 0, retrying: 0, running: false };
 const servesTranslation = () => translationMode === 'offline';
+let audioOrigin: number | undefined;
+type LiveTiming = { english: number; chinese?: number; revision?: number; observations: number };
+let liveTimes = new Map<string, LiveTiming>();
+const captionTimes = new WeakMap<Caption, {
+  end: number; settled: number; early?: number; fields: Partial<DiagnosticEvent>;
+}>();
+
+function updateLiveTimes() {
+  const next = new Map<string, LiveTiming>();
+  const now = performance.now();
+  for (const unit of previewUnits(preview)) {
+    const key = draftKey(unit);
+    const row = liveTimes.get(key) ?? { english: now, observations: 0 };
+    if (row.revision !== preview?.revision) {
+      row.observations++;
+      row.revision = preview?.revision;
+    }
+    if (draftModel.has(key)) row.chinese ??= now;
+    next.set(key, row);
+  }
+  liveTimes = next;
+}
 const serviceQueue = new TranslationQueue(
   (caption, signal) => {
     // A live draft of the same words was already translated: no second model call.
     const drafted = draftModel.get(draftKey(caption.text));
-    if (drafted !== undefined) return Promise.resolve(drafted);
-    return serviceTranslate(caption.text, serviceToken, signal);
+    const timing = captionTimes.get(caption);
+    const waited = timing ? performance.now() - timing.settled : 0;
+    if (timing) timing.fields.translationQueueMs = waited;
+    if (drafted !== undefined) {
+      if (timing) timing.fields.modelMs = 0;
+      return Promise.resolve(drafted);
+    }
+    return serviceTranslate(caption.text, serviceToken, signal, false, (modelMs, queueMs) => {
+      if (timing) Object.assign(timing.fields, { modelMs, translationQueueMs: waited + queueMs });
+    });
   },
-  (caption, text) => acceptTranslation({ sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text }),
+  (caption, text) => {
+    acceptTranslation({ sessionId: caption.sessionId, id: caption.id, revision: caption.revision, text });
+    const timing = captionTimes.get(caption);
+    if (timing) {
+      const now = performance.now();
+      recordDiagnostic('translation', 'caption_timing', { ...timing.fields,
+        firstChineseMs: (timing.early ?? now) - timing.end, finalChineseMs: now - timing.end });
+    }
+  },
   () => {}, { onChange: status => {
     translationStatus = status; publish({ type: 'translationStatus', status });
     if (!status.pending && !status.running) void pumpDrafts();
@@ -61,24 +99,46 @@ const serviceQueue = new TranslationQueue(
 const draftModel = new Map<string, string>();
 let drafts: DraftTranslations = {};
 let drafting = false;
+let tailTimer: ReturnType<typeof setTimeout> | undefined;
+const TAIL_SETTLE_MS = 1100;
 async function pumpDrafts() {
   if (drafting || translationMode !== 'offline' || state.phase !== 'capturing') return;
   if (translationStatus.pending || translationStatus.running) return;
-  // The last row is usually still being spoken; once the recognizer closes it
-  // with sentence punctuation it is very likely finished too.
+  clearTimeout(tailTimer);
   const units = previewUnits(preview);
-  const ready = /[.!?]["”’]*$/.test(units.at(-1) ?? '') ? units : units.slice(0, -1);
-  const unit = ready.find(text => !draftModel.has(draftKey(text)));
+  const unit = units.find((text, index) => {
+    const key = draftKey(text);
+    if (draftModel.has(key)) return false;
+    if (preview?.speechEnded) return true;
+    const row = liveTimes.get(key);
+    const tail = index === units.length - 1;
+    if (/[.!?]["”’]*$/.test(text)) {
+      if (!tail || !row || row.observations >= 2) return true;
+      // Moonshine often puts a period on a changing hypothesis. Give the next
+      // acoustic update time to replace it before showing a Chinese guess.
+      const remaining = TAIL_SETTLE_MS - (performance.now() - row.english);
+      if (remaining <= 0) return true;
+      tailTimer = setTimeout(() => void pumpDrafts(), Math.ceil(remaining));
+      return false;
+    }
+    // A clause can be ready while the microphone is still hearing the next
+    // one. Confirm it in two revisions before spending an idle model pass.
+    const clauseEnd = !tail || (/[,;:]$/.test(text) && text.split(/\s+/u).length >= 8);
+    return clauseEnd && (row?.observations ?? 0) >= 2;
+  });
   if (!unit) return;
+  const continued = !/[.!?]["”’]*$/.test(unit) && !(preview?.speechEnded && unit === units.at(-1));
   drafting = true;
   const session = state.sessionId;
   let done = false;
   try {
     const text = await serviceTranslate(unit, serviceToken, AbortSignal.timeout(8000), true);
-    if (session !== state.sessionId) return;
+    if (session !== state.sessionId || !servesTranslation()) return;
     const key = draftKey(unit);
     draftModel.set(key, text);
-    drafts = { ...drafts, [key]: finalTranslation(text, false, !/[.!?]["”’]*$/.test(unit)) };
+    const row = liveTimes.get(key);
+    if (row) row.chinese ??= performance.now();
+    drafts = { ...drafts, [key]: finalTranslation(text, false, continued) };
     if (draftModel.size > 300) {
       const oldest = draftModel.keys().next().value!;
       draftModel.delete(oldest);
@@ -93,7 +153,7 @@ async function pumpDrafts() {
     if (done) void pumpDrafts();
   }
 }
-function resetDrafts() { draftModel.clear(); drafts = {}; }
+function resetDrafts() { clearTimeout(tailTimer); draftModel.clear(); drafts = {}; }
 
 // Floating captions on the source page connect here and count as an open view.
 const overlays = new Set<ReturnType<typeof browser.runtime.connect>>();
@@ -162,6 +222,8 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
   captions = [];
   preview = undefined;
   sequence = 0;
+  audioOrigin = undefined;
+  liveTimes.clear();
   lastLease = Date.now();
   serviceQueue.reset();
   resetDrafts();
@@ -201,15 +263,27 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
           resolve();
         } else if (message.type === 'caption' && message.sessionId === state.sessionId) {
           if (!message.final) return;
-          const { preview: remainingPreview, ...caption } = message;
+          const { preview: remainingPreview, refineMs, refineQueueMs, ...caption } = message;
+          const live = liveTimes.get(draftKey(caption.text));
+          if (audioOrigin !== undefined) {
+            const end = audioOrigin + caption.end * 1000;
+            const settled = performance.now();
+            const fields = { sentence: Number(caption.id.split(':')[1]), settledMs: settled - end,
+              previewMs: live && live.english - end, refineMs, refineQueueMs };
+            recordDiagnostic('capture', 'english_settled', fields);
+            captionTimes.set(caption as Caption, { end, settled, early: live?.chinese, fields });
+          }
+          liveTimes.delete(draftKey(caption.text));
           captions = mergeCaption(captions, caption as Caption);
           if (remainingPreview) preview = mergePreview(preview, { ...remainingPreview, sessionId: message.sessionId }, state.sessionId);
+          if (remainingPreview) updateLiveTimes();
           // Replace the preview and add its settled sentence atomically.
           publish({ type: 'caption', caption, preview });
           if (servesTranslation()) serviceQueue.enqueue(caption as Caption);
           void pumpDrafts();
         } else if (message.type === 'preview' && message.sessionId === state.sessionId) {
           preview = mergePreview(preview, message as EnglishPreview, state.sessionId);
+          updateLiveTimes();
           publish({ type: 'preview', preview });
           void pumpDrafts();
         } else if (message.type === 'pending' && message.sessionId === state.sessionId && message.pending !== state.pending) {
@@ -251,6 +325,7 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
         lastMeter = Date.now();
       }
       if (state.phase !== 'capturing' || currentSocket.readyState !== WebSocket.OPEN) return;
+      audioOrigin ??= performance.now() - (data.offset + samples.length) / rate * 1000;
       if (currentSocket.bufferedAmount > rate * 4 * TRANSPORT_BACKLOG_SECONDS) {
         recordDiagnostic('capture', 'transport_overload');
         void stop('音频发送持续积压，已停止采集。请检查本机负载后重新开始；已有字幕已保留。', true);

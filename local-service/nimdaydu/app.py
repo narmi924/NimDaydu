@@ -245,14 +245,18 @@ a{{color:#b9e7c7}}p{{line-height:1.8}}</style><h1>NimDaydu</h1><p>本机语音�
             raise HTTPException(status_code=503, detail=f'Offline translation model missing. Run {SETUP_SCRIPT}.')
         if body.draft and translate_lock.locked():
             raise HTTPException(status_code=429, detail='Translation busy')
+        submitted = time.perf_counter()
         try:
             # Settled captions queue behind at most one running request.
             await asyncio.wait_for(translate_lock.acquire(), timeout=8)
         except asyncio.TimeoutError:
             raise HTTPException(status_code=429, detail='Translation busy') from None
         try:
+            started = time.perf_counter()
             translated = await asyncio.get_running_loop().run_in_executor(translation_executor, offline_translator.translate, body.text)
-            return {'text': translated, 'engine': getattr(offline_translator, 'name', None)}
+            return {'text': translated, 'engine': getattr(offline_translator, 'name', None),
+                    'modelMs': round((time.perf_counter() - started) * 1000),
+                    'queueMs': round((started - submitted) * 1000)}
         except ValueError:
             raise HTTPException(status_code=413, detail='Caption too long for the local model') from None
         except Exception:

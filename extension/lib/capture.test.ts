@@ -205,7 +205,9 @@ it('translates finished live rows early and reuses them when the caption settles
   sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 2, text: 'Check availability. Then we pay.',
     units: ['Check availability.', 'Then we pay.'], start: 0, end: 3 });
   await vi.advanceTimersByTimeAsync(10);
-  // A last row that already ends the sentence is drafted too.
+  // A period on the still-changing last row must survive another acoustic update.
+  expect(requests).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1100);
   expect(requests.map(request => request.text)).toEqual(['Check availability.', 'Then we pay.']);
   expect(runtime.sendMessage.mock.calls.some(([message]) => message.type === 'draft' && message.text === '检查可用性。')).toBe(true);
   expect((await command('snapshot')).drafts).toEqual({ [draftKey('Check availability.')]: '检查可用性。', [draftKey('Then we pay.')]: '其他。' });
@@ -226,7 +228,7 @@ it('translates the final programming language even when a similar name was draft
   });
   await command('start', { source: { tabId: 1, windowId: 1, title: 'Meeting' }, streamId: 'stream', token: 'test-token',
     sentenceHold: .4, autoSave: false, translationMode: 'offline' });
-  sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'We use C++.', start: 0, end: 2 });
+  sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'We use C++.', start: 0, end: 2, speechEnded: true });
   await vi.advanceTimersByTimeAsync(10);
   sockets[0]!.emit(settled('sentence:1', 'We use C#.', 0));
   sockets[0]!.emit(settled('sentence:2', 'We use C.', 2));
@@ -234,6 +236,37 @@ it('translates the final programming language even when a similar name was draft
   expect(requested).toEqual(['We use C++.', 'We use C#.', 'We use C.']);
   expect((await command('snapshot')).captions.map((c: { translation: string }) => c.translation))
     .toEqual(['我们用 C#。', '我们用 C。']);
+});
+
+it('waits for a stable clause, then translates an unpunctuated ending before refinement', async () => {
+  const requested: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    if (!String(url).endsWith('/translate')) return new Response('{}');
+    requested.push(JSON.parse(String(init?.body)).text);
+    return Response.json({ text: '会议字幕', modelMs: 15, queueMs: 3 });
+  });
+  await command('start', { source: { tabId: 1, windowId: 1, title: 'Meeting' }, streamId: 'stream',
+    token: 'test-token', autoSave: false, sentenceHold: .4, translationMode: 'offline' });
+  worklets[0].port.onmessage({ data: { samples: new Float32Array(3840).buffer, offset: 0 } });
+  const clause = 'We changed the price of the remote today,';
+  const preview = (revision: number, tail: string, speechEnded = false) => sockets[0]!.emit({
+    type: 'preview', sessionId: 'session-1', revision, start: 0, end: revision,
+    text: clause + ' ' + tail, units: [clause, tail], speechEnded,
+  });
+  preview(1, 'because the');
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual([]);
+  preview(2, 'because the batteries');
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual([clause]);
+  preview(3, 'because the batteries cost more', true);
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual([clause, 'because the batteries cost more']);
+  sockets[0]!.emit(settled('sentence:1', 'because the batteries cost more.', 0));
+  await vi.advanceTimersByTimeAsync(10);
+  const timing = (await command('diagnostics')).events.find((event: { code: string }) => event.code === 'caption_timing');
+  expect(timing).toMatchObject({ sentence: 1, modelMs: 0, firstChineseMs: expect.any(Number), finalChineseMs: expect.any(Number) });
+  expect(requested).toHaveLength(2);
 });
 
 it('does not translate when translation is disabled', async () => {

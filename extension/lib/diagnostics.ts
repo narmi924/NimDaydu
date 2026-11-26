@@ -1,7 +1,9 @@
 /** Bounded, in-memory operational events. Never accept transcript/error messages. */
-export type DiagnosticEvent = {
+const numericFields = ['durationMs', 'pending', 'attempt', 'closeCode', 'sentence', 'previewMs', 'settledMs',
+  'firstChineseMs', 'finalChineseMs', 'refineQueueMs', 'refineMs', 'translationQueueMs', 'modelMs'] as const;
+export type DiagnosticEvent = Partial<Record<typeof numericFields[number], number>> & {
   at: string; component: 'translation' | 'capture' | 'connection'; code: string;
-  errorName?: string; durationMs?: number; pending?: number; attempt?: number; closeCode?: number;
+  errorName?: string;
 };
 const events: DiagnosticEvent[] = [];
 const names = new Set(['AbortError', 'TimeoutError', 'NotSupportedError', 'InvalidStateError', 'NotAllowedError', 'OperationError', 'QuotaExceededError', 'NetworkError', 'TypeError', 'Error']);
@@ -15,7 +17,7 @@ export function recordDiagnostic(component: DiagnosticEvent['component'], code: 
   const event: DiagnosticEvent = { at: new Date().toISOString(), component,
     code: /^[a-z_]{1,40}$/.test(code) ? code : 'unknown' };
   if (fields.errorName) event.errorName = names.has(fields.errorName) ? fields.errorName : 'Error';
-  for (const key of ['durationMs', 'pending', 'attempt', 'closeCode'] as const) {
+  for (const key of numericFields) {
     const value = fields[key];
     if (typeof value === 'number' && Number.isFinite(value)) event[key] = Math.max(0, Math.round(value));
   }
@@ -34,7 +36,7 @@ export function safeCaptureDiagnostics(value: unknown) {
         code: /^[a-z_]{1,40}$/.test(event.code) ? event.code : 'unknown' };
       if (typeof event.at === 'string' && /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/.test(event.at)) safe.at = event.at;
       if (event.errorName && names.has(event.errorName)) safe.errorName = event.errorName;
-      for (const key of ['durationMs', 'pending', 'attempt', 'closeCode'] as const) if (typeof event[key] === 'number' && Number.isFinite(event[key])) safe[key] = event[key];
+      for (const key of numericFields) if (typeof event[key] === 'number' && Number.isFinite(event[key])) safe[key] = event[key];
       return safe;
     }) : [],
   };

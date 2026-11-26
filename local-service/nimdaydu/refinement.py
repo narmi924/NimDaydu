@@ -133,6 +133,7 @@ class RefinedEngine:
         self.held = None
         self.held_live = False
         self.held_at = 0
+        self.recent_level = self.quiet_seconds = 0.0
         self.revisions = {}
         self.last_final = None
         self.stats = {'completed': 0, 'fallbacks': 0, 'failures': 0, 'maxRefinementMs': 0, 'inferenceSeconds': 0.0}
@@ -144,6 +145,7 @@ class RefinedEngine:
             self.emit = emit
             self.warning = False
             self.held = None; self.held_live = False; self.revisions.clear(); self.last_final = None
+            self.recent_level = self.quiet_seconds = 0.0
             self.stats = {'completed': 0, 'fallbacks': 0, 'failures': 0, 'maxRefinementMs': 0, 'inferenceSeconds': 0.0}
         self.draft.begin(self._event)
 
@@ -151,7 +153,19 @@ class RefinedEngine:
         self.window.append(packet, rate)
         self.draft.audio(packet, rate, behind)
         with self.lock:
-            if self.held and not self.held_live and self.window.end / rate - self.held_at >= .8:
+            seconds = len(packet.samples) / rate
+            level = float(np.sqrt(np.mean(np.square(packet.samples))))
+            self.recent_level = max(level, self.recent_level * .5 ** (seconds / 1.5))
+            quiet = self.recent_level > .001 and level < min(.008, self.recent_level * .18)
+            self.quiet_seconds = self.quiet_seconds + seconds if quiet else 0.0
+            if not self.held or self.held_live:
+                return
+            # Release a completed native region early only when a real pause
+            # follows it. The live recognizer keeps its full acoustic context.
+            now = self.window.end / rate
+            pause = (not behind and self.quiet_seconds >= .32 and now - self.quiet_seconds - .3 <= self.held['end'] <= now
+                     and not weak(self.held['text']))
+            if pause or now - self.held_at >= .8:
                 self._flush_held()
 
     def _final(self, message, text):
@@ -203,7 +217,7 @@ class RefinedEngine:
             if forced or weak(message['text']) or not re.search(r'[.!?]["”’]*$', message['text']):
                 self.held = message; self.held_live = False
                 self.held_at = self.window.end / self.window.rate
-                self.emit({**message, 'final': False})
+                self.emit({**message, 'final': False, 'speechEnded': True})
                 return
             self.held = None; self.held_live = False
             self._submit(message)
@@ -227,7 +241,7 @@ class RefinedEngine:
             message = {**message, 'revision': revision}
             self.revisions[message['id']] = revision
             # Keep English readable while the final acoustic pass is pending.
-            self.emit({**message, 'final': False})
+            self.emit({**message, 'final': False, 'speechEnded': True})
             samples = self.window.slice(message['start'], message['end'])
             self.tasks = {task for task in self.tasks if not task.done()}
             if samples is None or message['end'] - message['start'] > 30 or len(self.tasks) >= 2:
@@ -236,7 +250,7 @@ class RefinedEngine:
             generation = self.generation
             callback = self.emit
             rate = self.window.rate
-            future = self.pool.submit(self._recognize, samples, rate)
+            future = self.pool.submit(self._recognize, samples, rate, time.perf_counter())
             self.pending[message['id']] = (future, message)
             self.tasks.add(future)
 
@@ -248,7 +262,7 @@ class RefinedEngine:
                         return
                     self.pending.pop(message['id'])
                     try:
-                        text, elapsed = task.result()
+                        text, elapsed, queued = task.result()
                         if not text:
                             raise ValueError('Empty acoustic second pass')
                     except Exception:
@@ -259,19 +273,21 @@ class RefinedEngine:
                     self.stats['completed'] += 1
                     self.stats['maxRefinementMs'] = max(self.stats['maxRefinementMs'], round(elapsed * 1000))
                     self.stats['inferenceSeconds'] += elapsed
-                    callback(self._final(message, text))
+                    callback({**self._final(message, text), 'refineMs': round(elapsed * 1000),
+                              'refineQueueMs': round(queued * 1000)})
                     if self.warning:
                         self.warning = False
                         callback({'type': 'warning', 'message': ''})
                     self.condition.notify_all()
             future.add_done_callback(done)
 
-    def _recognize(self, samples, rate):
+    def _recognize(self, samples, rate, submitted):
         started = time.perf_counter()
-        return self.refiner.transcribe(samples, rate), time.perf_counter() - started
+        return self.refiner.transcribe(samples, rate), time.perf_counter() - started, started - submitted
 
     def pause(self):
         self.draft.pause()
+        self.recent_level = self.quiet_seconds = 0.0
         with self.lock:
             self._flush_held()
         deadline = time.monotonic() + FINISH_TIMEOUT
