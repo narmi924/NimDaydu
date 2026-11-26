@@ -334,3 +334,15 @@ def test_file_keeps_recognizing_and_saves_english_if_translation_is_unavailable(
         assert events[-1]['missingTranslations'] == 2
         saved = client.get('/records/' + events[-1]['sessionId'], headers=headers).json()
         assert [c['text'] for c in saved['captions']] == ['First sentence.', 'Second sentence.']
+
+
+def test_file_sentences_cross_decoder_windows_but_not_silence():
+    from nimdaydu.media import _file_units
+    windows = [
+        ([('Hello.', 1, 2), ('Due', 10, 11), ('October', 11, 12)], 0, 12),
+        ([('9.', 12, 12.2), ('More', 23.5, 24)], 12, 24),
+        ([('Next.', 30, 31)], 24, 36),
+    ]
+    assert list(_file_units(windows)) == [
+        ('Hello.', 1, 2), ('Due October 9.', 10, 12.2), ('More', 23.5, 24), ('Next.', 30, 31),
+    ]

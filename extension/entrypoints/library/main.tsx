@@ -97,6 +97,13 @@ function Library() {
   const [url, setUrl] = useState('');
   const player = useRef<HTMLVideoElement>(null);
   const current = useRef<AbortController | undefined>(undefined);
+  async function playFrom(start: number) {
+    const video = player.current;
+    if (!video) return;
+    video.currentTime = start;
+    try { await video.play(); }
+    catch (err) { if (!(err instanceof DOMException && err.name === 'AbortError')) fail(err); }
+  }
   const version = useRef(0);
   const fail = (err: unknown) => setStatus(err instanceof Error ? err.message : '操作失败。');
   async function list(q: string) {
@@ -165,7 +172,7 @@ function Library() {
       {pages > 1 && <nav aria-label="字幕分页"><button disabled={!page} onClick={() => setPage(page - 1)}>上一页</button>
         {page + 1} / {pages}<button disabled={page + 1 >= pages} onClick={() => setPage(page + 1)}>下一页</button></nav>}
       {record.captions.slice(page * pageSize, (page + 1) * pageSize).map((c, index) => <article key={c.id} id={'caption-' + (page * pageSize + index)}>
-      {url ? <button onClick={() => { if (player.current) { player.current.currentTime = c.start; void player.current.play().catch(fail); } }}>{timestamp(c.start)}</button> : <time>{timestamp(c.start)}</time>}
+      {url ? <button onClick={() => void playFrom(c.start)}>{timestamp(c.start)}</button> : <time>{timestamp(c.start)}</time>}
       <p><HighlightedText text={c.text} terms={terms}/><br/><HighlightedText text={c.translation || ''} terms={terms}/></p>
       {c.recognizedText && terms.some(t => c.recognizedText!.toLowerCase().includes(t) && !c.text.toLowerCase().includes(t)) &&
         <small>原识别 · <HighlightedText text={c.recognizedText} terms={terms}/></small>}</article>)}</section>}</>;
