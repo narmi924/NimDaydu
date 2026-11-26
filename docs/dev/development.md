@@ -29,7 +29,7 @@ setup.sh / start.sh / stop.sh      macOS（Apple 芯片）、Linux x86-64
 ## 数据流
 
 1. 侧栏“开始”经 background 取得标签页或所选桌面音源。offscreen 与播放共用同一音频时钟，将低通滤波后的 16 kHz 单声道 PCM 发送到 `ws://127.0.0.1:8765/audio`。
-2. 服务端 Moonshine 产生实时英文，Parakeet 读取完整的连续原音，使用声学词时间定稿，`SentenceAssembler` 成句并切成字幕单元（`continued` 表示句子在下一条继续）。
+2. Moonshine 返回草稿文本和时间，关闭历史音频返回。Parakeet 从独立的有限内存窗口读取连续原音，使用声学词时间定稿，`SentenceAssembler` 成句并切成字幕单元（`continued` 表示句子在下一条继续）。
 3. offscreen 在本机 Hy-MT2 空闲时先翻已说完的行或稳定的从句。定稿与早译的英文匹配时复用中文，其余定稿优先排队翻译。侧栏隐藏或关闭也不受影响。
 4. offscreen 通过 runtime 消息更新侧栏，通过 `runtime.connect('nimdaydu-overlay')` 端口推送给悬浮字幕；悬浮字幕连接期间也算作打开的视图。
 5. 侧栏和悬浮字幕都关闭约 10 秒后停止采集。

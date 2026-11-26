@@ -31,8 +31,13 @@ class MoonshineEngine:
         if model not in manifest:
             raise RuntimeError(f"Model '{model}' missing. Run {SETUP_SCRIPT} again and choose {model}.")
         # Manifests written on Windows before v0.6 use backslashes.
+        # Otherwise every draft returns PCM for all earlier lines and the Python
+        # binding turns those samples into lists again. Refinement owns its audio.
+        options = {"return_audio_data": "false"}
+        if max_segment_seconds:
+            options["vad_max_segment_duration"] = max_segment_seconds
         self.transcriber = Transcriber(ROOT / manifest[model]["path"].replace("\\", "/"), ModelArch(manifest[model]["arch"]),
-                                       update_interval=UPDATE_INTERVAL, options={"vad_max_segment_duration": max_segment_seconds} if max_segment_seconds else None)
+                                       update_interval=UPDATE_INTERVAL, options=options)
         self.model = model
         self.stream = None
         self.emit: Callable = lambda _: None
