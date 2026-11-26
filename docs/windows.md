@@ -95,4 +95,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Install-DesktopLau
 | 提示“语音识别持续积压” | 关闭视频剪辑、大型游戏等占用 CPU 很多的程序。笔记本插电使用效果更好 |
 | 端口 8765 被占用 | 先双击 Stop-NimDaydu.cmd。如果还是不行，重启电脑 |
 
-更多使用说明见 [README](../README.md)。
+更多使用说明见 [中文 README](../README.zh-CN.md)。

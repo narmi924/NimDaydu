@@ -105,4 +105,4 @@
 
 遇到其他问题，可以在项目的 GitHub 页面提交 issue，并附上上面两个日志文件。
 
-更多使用说明见 [README](../README.md)。
+更多使用说明见 [中文 README](../README.zh-CN.md)。

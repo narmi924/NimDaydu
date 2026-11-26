@@ -11,9 +11,16 @@ import { exportCaptions, subtitleText } from '../../lib/export';
 import { exportDiagnostics } from '../../lib/export-diagnostics';
 import Icon from '../../lib/Icon';
 
-const PHASE_LABELS = { idle: '未开始', starting: '连接中', capturing: '正在聆听', paused: '已暂停', stopping: '正在结束', stopped: '已结束', error: '已断开' };
+import { useUiLanguage } from '../../lib/useUiLanguage';
+import { messagesFor } from '../../lib/ui-messages';
+import { localizeNotice } from '../../lib/ui-notices';
+
+const phaseLabels = { idle: 'idle', starting: 'starting', capturing: 'listening', paused: 'paused', stopping: 'stopping', stopped: 'stopped', error: 'captureError' } as const;
+const sourceLabels = { '网页': 'webPage', '测试网页': 'sampleSource', '哔哩哔哩': 'bilibili', 'Desktop': 'desktopAudio' } as const;
 
 export default function App() {
+  const language = useUiLanguage('liveCaptions');
+  const t = messagesFor(language);
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [source, setSource] = useState<Source>();
   const [state, setState] = useState<CaptureState>({ phase: 'idle' });
@@ -232,10 +239,14 @@ export default function App() {
   const waitingTranslation = !translationFailed && mode !== 'original' && captions.some(c => c.translationRevision !== c.revision);
   // Rows already show live English and reserved Chinese slots; a status line
   // that comes and goes at the bottom would only make the list jump.
-  const pendingLabel = mode !== 'translated' ? '' : waitingTranslation ? '正在翻译…' : active && state.pending ? '正在整理译文…' : '';
-  const translationMessage = translationStatus.failed > 0
-    ? `${translationStatus.failed} 句译文待恢复。${active ? '英文转录继续。' : '英文字幕已保留。'}`
-    : translationStatus.retrying > 0 ? `翻译正在重试。${active ? '英文转录继续。' : '英文字幕已保留。'}` : '';
+  const pendingLabel = mode !== 'translated' ? '' : waitingTranslation ? t('translatingEllipsis') : active && state.pending ? t('assemblingTranslation') : '';
+  const translationMessage = translationStatus.failed > 0 ? t('translationsToRetry', translationStatus.failed)
+    : translationStatus.retrying > 0 ? t('translationRetrying') : '';
+  const noticeText = notice || state.saveError || state.message;
+  const site = currentSource?.site || '网页';
+  const sourceLabel = Object.hasOwn(sourceLabels, site) ? t(sourceLabels[site as keyof typeof sourceLabels]) : site;
+  const sourceTitle = currentSource?.title === '当前网页' ? t('currentTab')
+    : site === 'Desktop' && currentSource?.title === '桌面音频' ? t('desktopAudio') : currentSource?.title;
   // Chinese-only mode shows live rows only once they have early Chinese.
   const visiblePreview = !search.trim() && Boolean(preview?.text)
     && (mode !== 'translated' || previewUnits(preview).some(unit => drafts[draftKey(unit)]));
@@ -244,59 +255,59 @@ export default function App() {
     <header className="header">
       <h1>NimDaydu</h1>
       <div className="header-actions">
-        <button className="icon-button" title={`显示或隐藏网页上的悬浮字幕（${IS_MAC ? 'Option' : 'Alt'}+Shift+O）`} aria-label="显示或隐藏悬浮字幕" onClick={() => void toggleOverlay()}><Icon name="overlay"/></button>
-        <button className="icon-button" title="设置" aria-label="设置" onClick={() => void browser.runtime.openOptionsPage()}><Icon name="settings"/></button>
+        <button className="icon-button" title={t('toggleOverlay') + ` (${IS_MAC ? 'Option' : 'Alt'}+Shift+O)`} aria-label={t('toggleOverlay')} onClick={() => void toggleOverlay()}><Icon name="overlay"/></button>
+        <button className="icon-button" title={t('settings')} aria-label={t('settings')} onClick={() => void browser.runtime.openOptionsPage()}><Icon name="settings"/></button>
         <div className="menu-wrap" ref={menuRef}>
-          <button className="icon-button" title="更多" aria-label="更多" aria-expanded={menu} aria-haspopup="menu" onClick={() => setMenu(v => !v)}><Icon name="more"/></button>
+          <button className="icon-button" title={t('more')} aria-label={t('more')} aria-expanded={menu} aria-haspopup="menu" onClick={() => setMenu(v => !v)}><Icon name="more"/></button>
           {menu && <div className="menu" role="menu">
-            <button role="menuitem" disabled={active || !connection} onClick={startDesktop}>转录桌面声音…</button>
-            <button role="menuitem" onClick={() => { setSearching(true); setMenu(false); }}>搜索字幕</button>
-            <button role="menuitem" aria-label="导出双语 TXT" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'txt'); setMenu(false); }}>导出 TXT</button>
-            <button role="menuitem" aria-label="导出字幕 JSON" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'json'); setMenu(false); }}>导出 JSON</button>
-            {(['srt', 'md'] as const).map(format => <button key={format} role="menuitem" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, format); setMenu(false); }}>导出 {format === 'md' ? 'Markdown' : 'SRT'}</button>)}
-            <button role="menuitem" disabled={!captions.length} onClick={() => { void navigator.clipboard.writeText(subtitleText(visible, 'md')).catch(() => setNotice('复制失败，请使用导出。')); setMenu(false); }}>复制双语字幕</button>
-            <button role="menuitem" onClick={() => { void browser.tabs.create({ url: browser.runtime.getURL('/library.html' as never) }); setMenu(false); }}>历史记录与文件转录</button>
-            <button role="menuitem" onClick={() => { void exportDiagnostics(translationStatus); setMenu(false); }}>导出诊断</button>
+            <button role="menuitem" disabled={active || !connection} onClick={startDesktop}>{t('desktopCapture')}</button>
+            <button role="menuitem" onClick={() => { setSearching(true); setMenu(false); }}>{t('searchCaptions')}</button>
+            <button role="menuitem" aria-label={t('exportTxt')} disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'txt', language); setMenu(false); }}>{t('exportFormat', 'TXT')}</button>
+            <button role="menuitem" aria-label={t('exportJson')} disabled={!captions.length} onClick={() => { exportCaptions(captions, state, 'json', language); setMenu(false); }}>{t('exportFormat', 'JSON')}</button>
+            {(['srt', 'md'] as const).map(format => <button key={format} role="menuitem" disabled={!captions.length} onClick={() => { exportCaptions(captions, state, format, language); setMenu(false); }}>{t('exportFormat', format === 'md' ? 'Markdown' : 'SRT')}</button>)}
+            <button role="menuitem" disabled={!captions.length} onClick={() => { void navigator.clipboard.writeText(subtitleText(visible, 'md')).catch(() => setNotice('复制失败，请使用导出。')); setMenu(false); }}>{t('copyBilingual')}</button>
+            <button role="menuitem" onClick={() => { void browser.tabs.create({ url: browser.runtime.getURL('/library.html' as never) }); setMenu(false); }}>{t('historyAndFiles')}</button>
+            <button role="menuitem" onClick={() => { void exportDiagnostics(translationStatus); setMenu(false); }}>{t('exportDiagnostics')}</button>
             <div className="menu-divider"/>
-            <button role="menuitem" disabled={active || !captions.length} onClick={() => void control('clear')}>清空字幕</button>
+            <button role="menuitem" disabled={active || !captions.length} onClick={() => void control('clear')}>{t('clearCaptions')}</button>
           </div>}
         </div>
       </div>
     </header>
-    <section className="session" aria-label="当前来源">
-      <div className="source"><span className="site">{currentSource?.site || '网页'}</span><span className="source-title" title={currentSource?.title}>{currentSource?.title || '在声音所在标签页点击插件图标'}</span></div>
-      <div className="session-meta"><span className={`status-dot ${state.phase}`}/><span>{state.phase === 'capturing' && state.recovering ? '正在追赶' : PHASE_LABELS[state.phase]}</span>{state.startedAt && <time>{timestamp(elapsed)}</time>}<span className="languages">EN → 中文</span></div>
+    <section className="session" aria-label={t('currentSource')}>
+      <div className="source"><span className="site">{sourceLabel}</span><span className="source-title" title={sourceTitle}>{sourceTitle || t('selectSource')}</span></div>
+      <div className="session-meta"><span className={`status-dot ${state.phase}`}/><span>{state.phase === 'capturing' && state.recovering ? t('catchingUp') : t(phaseLabels[state.phase])}</span>{state.startedAt && <time>{timestamp(elapsed)}</time>}<span className="languages">{t('languagePair')}</span></div>
     </section>
-    {(notice || state.saveError || state.message || translationMessage) && <div className="notice" role="status"><p>{notice || state.saveError || state.message || translationMessage}</p>{translationStatus.failed > 0 && <button className="text-button" disabled={repairing} onClick={() => void repairTranslation()}>{repairing ? '恢复中…' : '恢复翻译'}</button>}{notice && <button className="icon-button small" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="close" size={14}/></button>}</div>}
+    {(noticeText || translationMessage) && <div className="notice" role="status"><p>{noticeText ? localizeNotice(language, noticeText) : `${translationMessage} ${t(active ? 'englishContinues' : 'englishKept')}`}</p>{translationStatus.failed > 0 && <button className="text-button" disabled={repairing} onClick={() => void repairTranslation()}>{repairing ? t('recovering') : t('retryTranslation')}</button>}{notice && <button className="icon-button small" aria-label={t('dismissNotice')} onClick={() => setNotice('')}><Icon name="close" size={14}/></button>}</div>}
     {editCaption && <form className="term-form" onSubmit={e => { e.preventDefault(); void commitTerm(); }}>
       <p>{editCaption.recognizedText || editCaption.text}</p>
-      <label>听成<input required maxLength={100} value={alias} onChange={e => setAlias(e.target.value)}/></label>
-      <label>改为<input required maxLength={100} value={replacement} onChange={e => setReplacement(e.target.value)}/></label>
-      <select aria-label="纠词范围" value={scope} onChange={e => setScope(e.target.value)}><option value="line">仅这句</option><option value="session">整场</option><option value="remember">整场及以后</option></select>
-      <button disabled={editing}>应用</button><button type="button" disabled={editing} onClick={() => void commitTerm(true)}>撤销上次纠词</button><button type="button" onClick={() => setEditId('')}>关闭</button></form>}
-    {searching && <div className="search-row"><Icon name="search" size={16}/><input aria-label="搜索字幕" placeholder="搜索字幕" value={search} autoFocus onChange={e => { setSearch(e.target.value); setHit(0); setFollowing(false); }} onKeyDown={e => { if (e.key === 'Escape') { setSearching(false); setSearch(''); } }}/>{search && visible.length > 0 && <><span>{Math.min(hit + 1, visible.length)}/{visible.length}</span><button aria-label="上一条匹配" onClick={() => jumpHit(-1)}>↑</button><button aria-label="下一条匹配" onClick={() => jumpHit(1)}>↓</button></>}<button className="icon-button small" aria-label="关闭搜索" onClick={() => { setSearching(false); setSearch(''); }}><Icon name="close" size={14}/></button></div>}
-    <div className="transcript" aria-label="双语字幕" ref={scrollRef} onScroll={() => {
+      <label>{t('heardAs')}<input required maxLength={100} value={alias} onChange={e => setAlias(e.target.value)}/></label>
+      <label>{t('replaceWith')}<input required maxLength={100} value={replacement} onChange={e => setReplacement(e.target.value)}/></label>
+      <select aria-label={t('correctionScope')} value={scope} onChange={e => setScope(e.target.value)}><option value="line">{t('thisLine')}</option><option value="session">{t('wholeSession')}</option><option value="remember">{t('rememberCorrection')}</option></select>
+      <button disabled={editing}>{t('apply')}</button><button type="button" disabled={editing} onClick={() => void commitTerm(true)}>{t('undoCorrection')}</button><button type="button" onClick={() => setEditId('')}>{t('close')}</button></form>}
+    {searching && <div className="search-row"><Icon name="search" size={16}/><input aria-label={t('searchCaptions')} placeholder={t('searchCaptions')} value={search} autoFocus onChange={e => { setSearch(e.target.value); setHit(0); setFollowing(false); }} onKeyDown={e => { if (e.key === 'Escape') { setSearching(false); setSearch(''); } }}/>{search && visible.length > 0 && <><span>{Math.min(hit + 1, visible.length)}/{visible.length}</span><button aria-label={t('previousMatch')} onClick={() => jumpHit(-1)}>↑</button><button aria-label={t('nextMatch')} onClick={() => jumpHit(1)}>↓</button></>}<button className="icon-button small" aria-label={t('closeSearch')} onClick={() => { setSearching(false); setSearch(''); }}><Icon name="close" size={14}/></button></div>}
+    <div className="transcript" aria-label={t('bilingualCaptions')} ref={scrollRef} onScroll={() => {
       const element = scrollRef.current;
       if (element) setFollowing(element.scrollHeight - element.scrollTop - element.clientHeight < 70);
     }}>
-      {end > 60 && <button className="text-button" onClick={() => { setFollowing(false); setPageEnd(end - 60); scrollRef.current?.scrollTo(0, 0); }}>前 60 段</button>}
-      {page.map(paragraph => <ParagraphRow key={paragraph.id} paragraph={paragraph} mode={mode} match={search} onEdit={id => { setEditId(id); setAlias(window.getSelection()?.toString().trim() || ''); setReplacement(''); setScope('line'); }}/>)}
-      {end < paragraphs.length && <button className="text-button" onClick={() => setPageEnd(Math.min(paragraphs.length, end + 60))}>后 60 段</button>}
-      {visiblePreview && end === paragraphs.length && <LiveRows preview={preview} mode={mode} drafts={drafts}/>}
+      {end > 60 && <button className="text-button" onClick={() => { setFollowing(false); setPageEnd(end - 60); scrollRef.current?.scrollTo(0, 0); }}>{t('earlierParagraphs')}</button>}
+      {page.map(paragraph => <ParagraphRow key={paragraph.id} paragraph={paragraph} mode={mode} language={language} match={search} onEdit={id => { setEditId(id); setAlias(window.getSelection()?.toString().trim() || ''); setReplacement(''); setScope('line'); }}/>)}
+      {end < paragraphs.length && <button className="text-button" onClick={() => setPageEnd(Math.min(paragraphs.length, end + 60))}>{t('laterParagraphs')}</button>}
+      {visiblePreview && end === paragraphs.length && <LiveRows preview={preview} mode={mode} language={language} drafts={drafts}/>}
       {!visible.length && !visiblePreview && <div className="empty-state">
-        {!active && !search && connection && <button className="text-button" onClick={() => void browser.tabs.create({ url: 'http://127.0.0.1:8765/sample/' })}>试听英语样本</button>}
-        <p className="empty-title">{search ? '没有匹配的字幕' : active ? mode === 'translated' ? '等待完整译文' : '等待语音' : checking ? '正在连接本机服务' : connectionError ? '本机服务未连接' : '开始后显示双语字幕'}</p>
-        {!search && <p>{active ? mode === 'translated' ? '句子整理和翻译完成后会显示在这里。' : '英文实时显示，中文在句子完成后更新。' : connectionError || '播放网页中的声音，然后点击开始。'}</p>}
-        {!active && connectionError && <button className="text-button" onClick={() => { setChecking(true); void connect(); }}>重新连接</button>}
+        {!active && !search && connection && <button className="text-button" onClick={() => void browser.tabs.create({ url: `http://127.0.0.1:8765/sample/?lang=${language}` })}>{t('playSample')}</button>}
+        <p className="empty-title">{search ? t('noMatches') : active ? mode === 'translated' ? t('waitingTranslation') : t('waitingSpeech') : checking ? t('connectingService') : connectionError ? t('serviceDisconnected') : t('startToSeeCaptions')}</p>
+        {!search && <p>{active ? mode === 'translated' ? t('waitTranslationHelp') : t('captionHelp') : connectionError ? localizeNotice(language, connectionError) : t('startHelp')}</p>}
+        {!active && connectionError && <button className="text-button" onClick={() => { setChecking(true); void connect(); }}>{t('reconnect')}</button>}
       </div>}
       {pendingLabel && !search && <div className="pending" role="status"><span className="pending-dot"/>{pendingLabel}</div>}
     </div>
-    {!following && (readable.length > 0 || visiblePreview) && <button className="back-to-live" onClick={() => { setSearch(''); setPageEnd(undefined); setFollowing(true); }}><Icon name="arrow" size={14}/>回到最新</button>}
-    {state.idleStopAt && state.phase === 'capturing' && <div className="notice" role="status">十分钟没有新字幕，将在 {Math.max(0, Math.ceil((state.idleStopAt - Date.now()) / 1000))} 秒后结束。
-      <button onClick={() => void sendOffscreen({ type: 'continueListening' })}>继续听</button><button onClick={() => void control('stop')}>结束</button></div>}
+    {!following && (readable.length > 0 || visiblePreview) && <button className="back-to-live" onClick={() => { setSearch(''); setPageEnd(undefined); setFollowing(true); }}><Icon name="arrow" size={14}/>{t('latest')}</button>}
+    {state.idleStopAt && state.phase === 'capturing' && <div className="notice" role="status">{t('idleCountdown', Math.max(0, Math.ceil((state.idleStopAt - Date.now()) / 1000)))}
+      <button onClick={() => void sendOffscreen({ type: 'continueListening' })}>{t('keepListening')}</button><button onClick={() => void control('stop')}>{t('end')}</button></div>}
     <footer className="controls">
-      {!active ? <button className="button primary" onClick={() => void start()} disabled={working || checking || !source}><Icon name="play" size={16}/>{working ? '连接中…' : '开始'}</button>
-        : <><button className="button primary" onClick={() => void control(state.phase === 'paused' ? 'resume' : 'pause')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name={state.phase === 'paused' ? 'play' : 'pause'} size={16}/>{state.phase === 'paused' ? '继续' : '暂停'}</button><button className="button stop" onClick={() => void control('stop')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name="stop" size={16}/>结束</button></>}
+      {!active ? <button className="button primary" onClick={() => void start()} disabled={working || checking || !source}><Icon name="play" size={16}/>{working ? t('connecting') : t('start')}</button>
+        : <><button className="button primary" onClick={() => void control(state.phase === 'paused' ? 'resume' : 'pause')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name={state.phase === 'paused' ? 'play' : 'pause'} size={16}/>{state.phase === 'paused' ? t('resume') : t('pause')}</button><button className="button stop" onClick={() => void control('stop')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name="stop" size={16}/>{t('end')}</button></>}
     </footer>
   </div>;
 }

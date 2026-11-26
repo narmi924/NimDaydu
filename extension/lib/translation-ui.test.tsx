@@ -6,6 +6,7 @@ import App from '../entrypoints/sidepanel/App';
 
 const mock = vi.hoisted(() => ({ listeners: new Set<(message: any) => void>(), send: vi.fn() }));
 vi.mock('wxt/browser', () => ({ browser: {
+  i18n: { getUILanguage: () => 'en-US' },
   runtime: { sendMessage: (...args: any[]) => mock.send(...args),
     onMessage: { addListener: (fn: any) => mock.listeners.add(fn), removeListener: (fn: any) => mock.listeners.delete(fn) } },
   storage: { local: { get: async () => ({ settings: { schema: 2, translationMode: 'offline', token: 'test-token' } }) },
@@ -44,8 +45,8 @@ it('keeps English and completed Chinese visible when the service reports a trans
   });
   expect(host.textContent).toContain('Sentence 1.');
   expect(host.textContent).toContain('第二句译文。');
-  expect(host.textContent).toContain('正在聆听');
-  expect(host.textContent).toContain('恢复翻译');
+  expect(host.textContent).toContain('Listening');
+  expect(host.textContent).toContain('Retry translation');
   expect(mock.send.mock.calls.some(([message]) => message.type === 'stop')).toBe(false);
 });
 
@@ -56,7 +57,7 @@ it('requests service repair without restarting capture or changing completed Chi
     emit({ type: 'translation', sessionId: 'one', id: '2', revision: 1, text: '第二句保持。' });
     emit({ type: 'translationStatus', status: { pending: 1, failed: 1, retrying: 0, running: false } });
   });
-  const repair = [...host.querySelectorAll('button')].find(button => button.textContent === '恢复翻译');
+  const repair = [...host.querySelectorAll('button')].find(button => button.textContent === 'Retry translation');
   expect(repair).toBeDefined();
   mock.send.mockImplementationOnce(async (message: any) => {
     expect(message.type).toBe('retryTranslation');

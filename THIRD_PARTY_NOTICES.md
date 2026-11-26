@@ -1,6 +1,6 @@
 # Third-party notices
 
-NimDaydu's personal development build uses these open-source components. Their original license terms remain applicable.
+NimDaydu uses these third-party components under their respective licenses.
 
 | Component | Source | License |
 |---|---|---|
@@ -18,7 +18,9 @@ Parakeet attribution: **NVIDIA**, [Parakeet-TDT-0.6B-v3](https://huggingface.co/
 
 The optional ASR evaluation uses a local subset of [LibriSpeech](https://huggingface.co/datasets/openslr/librispeech_asr), **Vassil Panayotov, Guoguo Chen, Daniel Povey and Sanjeev Khudanpur**, “LibriSpeech: An ASR corpus based on public domain audio books,” ICASSP 2015, distributed under CC BY 4.0. Downloaded audio, references and results stay in the ignored `artifacts/asr-evaluation/` directory and are not bundled with the extension.
 
-Moonshine downloads use the upstream downloader's supplied integrity metadata. Dependency licenses are also present in the installed Python/npm packages. If a future version is distributed beyond personal use, include the full applicable upstream notices in that distribution.
+Moonshine downloads use the upstream downloader's supplied integrity metadata. Dependency licenses are also present in the installed Python/npm packages.
+
+The floating-caption screenshot, Chinese side-panel screenshot, and architecture example show machine-generated captions from the [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). The floating-caption screenshot uses [Jitsi Meet gallery view](https://commons.wikimedia.org/wiki/File:Jitsi_Meet_gallery_view.jpg) by Sphere231 ([CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/)) as its background.
 
 Hy-MT2 notice: The Hy-MT2-1.8B model is released by Tencent under Apache 2.0. The setup scripts download unmodified GGUF weights from Tencent's Hugging Face repositories and pin their SHA256; the weights are not redistributed with this repository. NimDaydu is not affiliated with or endorsed by Tencent.
 

@@ -1,3 +1,5 @@
+import type { UiLanguage } from './ui-language';
+import { messagesFor } from './ui-messages';
 import type { Caption, CaptureState } from './types';
 import { timestamp } from './types';
 export type ExportFormat = 'txt' | 'json' | 'srt' | 'md';
@@ -15,9 +17,10 @@ export function subtitleText(captions: Caption[], format: 'srt' | 'md') {
     return `**${timestamp(c.start)}**  \n` + lines.join('  \n');
   }).join('\n\n') + '\n';
 }
-export function exportCaptions(captions: Caption[], state: CaptureState, format: ExportFormat) {
+export function exportCaptions(captions: Caption[], state: CaptureState, format: ExportFormat, language: UiLanguage) {
+  const t = messagesFor(language);
   const text = format === 'srt' || format === 'md' ? subtitleText(captions, format) : format === 'json' ? JSON.stringify({ product: 'NimDaydu', version: 2, sessionId: state.sessionId, source: state.source, startedAt: state.startedAt, captions }, null, 2)
-    : `NimDaydu · ${state.source?.title || '网页字幕'}\n${new Date(state.startedAt || Date.now()).toLocaleString()}\n\n` + captions.map(c => `[${timestamp(c.start)}]${c.incomplete ? ' [语句未完整]' : ''}\n${c.translation || ''}\n${c.text}\n`).join('\n');
+    : `NimDaydu · ${state.source?.title || t('webCaptions')}\n${new Date(state.startedAt || Date.now()).toLocaleString(language)}\n\n` + captions.map(c => `[${timestamp(c.start)}]${c.incomplete ? ' [' + t('incompleteExport') + ']' : ''}\n${c.translation || ''}\n${c.text}\n`).join('\n');
   const url = URL.createObjectURL(new Blob([text], { type: format === 'json' ? 'application/json;charset=utf-8' : 'text/plain;charset=utf-8' }));
   const anchor = document.createElement('a');
   anchor.href = url; anchor.download = `NimDaydu-${new Date(state.startedAt || Date.now()).toISOString().replace(/[:.]/g, '-')}.${format}`;

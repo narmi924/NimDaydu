@@ -1,0 +1,14 @@
+{
+  "extensionDescription": {
+    "message": "Transcribe browser audio on your computer and read live English and Chinese captions."
+  },
+  "actionTitle": {
+    "message": "NimDaydu: Caption this tab"
+  },
+  "openPanel": {
+    "message": "Open the NimDaydu side panel"
+  },
+  "toggleOverlay": {
+    "message": "Show or hide floating captions"
+  }
+}

@@ -1,3 +1,5 @@
+import type { UiLanguage } from './ui-language';
+import { messagesFor } from './ui-messages';
 import { memo } from 'react';
 import { draftKey, timestamp, type DraftTranslations, type EnglishPreview, type ViewMode } from './types';
 import { previewUnits, type Paragraph } from './reader';
@@ -16,9 +18,10 @@ export function HighlightedText({ text, terms }: { text: string; terms: string[]
  * Chinese. In bilingual mode the Chinese line is reserved before the
  * translation arrives, so filling it in never pushes the rows around.
  */
-export const ParagraphRow = memo(function ParagraphRow({ paragraph, mode, onEdit, match }: { paragraph: Paragraph; mode: ViewMode; onEdit?: (id: string) => void; match?: string }) {
+export const ParagraphRow = memo(function ParagraphRow({ paragraph, mode, onEdit, match, language }: { paragraph: Paragraph; mode: ViewMode; language: UiLanguage; onEdit?: (id: string) => void; match?: string }) {
+  const t = messagesFor(language);
   return <article className="paragraph">
-    <div className="paragraph-meta"><time>{timestamp(paragraph.captions[0]!.start)}</time>{paragraph.captions.some(c => c.incomplete) && <span>语句未完</span>}</div>
+    <div className="paragraph-meta"><time>{timestamp(paragraph.captions[0]!.start)}</time>{paragraph.captions.some(c => c.incomplete) && <span>{t('incomplete')}</span>}</div>
     {paragraph.captions.map(caption => {
       const translated = caption.translationRevision === caption.revision ? caption.translation : undefined;
       function highlight(text: string) {
@@ -26,11 +29,11 @@ export const ParagraphRow = memo(function ParagraphRow({ paragraph, mode, onEdit
       }
       return <div className="unit" data-caption-id={caption.id} key={caption.id}>
         {mode !== 'original' && (translated ? <p className="chinese" lang="zh-CN">{highlight(translated)}</p>
-          : mode === 'bilingual' && <p className="chinese pending" aria-label="正在翻译">…</p>)}
+          : mode === 'bilingual' && <p className="chinese pending" aria-label={t('translating')}>…</p>)}
         {(mode !== 'translated' || !translated) && <p className={mode === 'original' || mode === 'translated' ? 'english only' : 'english'} lang="en">{highlight(caption.text)}</p>}
         {match?.trim() && caption.recognizedText?.toLowerCase().includes(match.trim().toLowerCase())
-          && !caption.text.toLowerCase().includes(match.trim().toLowerCase()) && <small>原识别 · {highlight(caption.recognizedText)}</small>}
-        {onEdit && <button className="edit-term" title="更正这句中的词" aria-label={`更正 ${caption.text}`} onClick={() => onEdit(caption.id)}>纠词</button>}
+          && !caption.text.toLowerCase().includes(match.trim().toLowerCase()) && <small>{t('recognizedAs')} · {highlight(caption.recognizedText)}</small>}
+        {onEdit && <button className="edit-term" title={t('correctTerm')} aria-label={t('correctCaption', caption.text)} onClick={() => onEdit(caption.id)}>{t('editTerm')}</button>}
       </div>;
     })}
   </article>;
@@ -40,12 +43,13 @@ export const ParagraphRow = memo(function ParagraphRow({ paragraph, mode, onEdit
  * Live English, already cut into the rows the settled captions will occupy.
  * Complete rows may carry an early (draft) Chinese, shown dimmed.
  */
-export const LiveRows = memo(function LiveRows({ preview, mode, drafts = {} }: { preview?: EnglishPreview; mode: ViewMode; drafts?: DraftTranslations }) {
+export const LiveRows = memo(function LiveRows({ preview, mode, drafts = {}, language }: { preview?: EnglishPreview; mode: ViewMode; language: UiLanguage; drafts?: DraftTranslations }) {
+  const t = messagesFor(language);
   const units = previewUnits(preview);
   const rows = units.map((unit, index) => ({ unit, index, zh: drafts[draftKey(unit)] }))
     .filter(row => mode !== 'translated' || row.zh);
   if (!rows.length) return null;
-  return <section className="live" aria-label="实时字幕">
+  return <section className="live" aria-label={t('liveCaptions')}>
     {rows.map(({ unit, index, zh }) => <div className="unit live" key={index}>
       {mode !== 'original' && (zh ? <p className="chinese draft" lang="zh-CN">{zh}</p> : <p className="chinese slot" aria-hidden="true">…</p>)}
       {mode !== 'translated' && <p className={mode === 'original' ? 'english only' : 'english'} lang="en">{unit}{index === units.length - 1 && <span className="caret" aria-hidden="true"/>}</p>}
