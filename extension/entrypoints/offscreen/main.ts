@@ -15,6 +15,13 @@ let context: AudioContext | undefined;
 let worklet: AudioWorkletNode | undefined;
 let socket: WebSocket | undefined;
 let lastLease = Date.now();
+let idleReminder = false;
+let lastSpeech = Date.now();
+const IDLE_NOTICE_MS = 10 * 60_000, IDLE_GRACE_MS = 60_000;
+function continueListening() {
+  lastSpeech = Date.now();
+  if (state.idleStopAt) setState({ idleStopAt: undefined });
+}
 let lastMeter = 0;
 let sequence = 0;
 let stopping: Promise<void> | undefined;
@@ -202,7 +209,7 @@ async function cleanup() {
 async function stop(message?: string, failed = false) {
   if (stopping) return stopping;
   stopping = (async () => {
-    setState({ phase: 'stopping' });
+    setState({ phase: 'stopping', idleStopAt: undefined });
     if (!failed && socket?.readyState === WebSocket.OPEN) {
       const currentSocket = socket;
       const closed = new Promise<void>(resolve => {
@@ -218,7 +225,7 @@ async function stop(message?: string, failed = false) {
   return stopping;
 }
 
-async function start(source: Source, streamId: string, token: string, sentenceHold: number, autoSave: boolean, mode: TranslationMode = DEFAULT_SETTINGS.translationMode, desktop = false) {
+async function start(source: Source, streamId: string, token: string, sentenceHold: number, autoSave: boolean, mode: TranslationMode = DEFAULT_SETTINGS.translationMode, desktop = false, remind = false) {
   if (isActive(state.phase)) throw new Error('已有会话运行中。');
   let selected: MediaStream | undefined;
   if (desktop) {
@@ -243,6 +250,7 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
   serviceQueue.reset();
   resetDrafts();
   translationMode = mode;
+  idleReminder = remind;
   serviceToken = token;
   state = { phase: 'starting', source, startedAt: Date.now() };
   setState({});
@@ -271,6 +279,7 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
         const message = JSON.parse(event.data);
         if (message.type === 'ready') {
           clearTimeout(timeout);
+          continueListening();
           setState({ phase: 'capturing', sessionId: message.sessionId, model: message.model });
           savingUnsupported = autoSave && message.autoSaveSupported !== true;
           outputs.begin(message.sessionId, token, autoSave && !savingUnsupported);
@@ -278,6 +287,7 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
           resolve();
         } else if (message.type === 'caption' && message.sessionId === state.sessionId) {
           if (!message.final) return;
+          continueListening();
           const { preview: remainingPreview, refineMs, refineQueueMs, ...caption } = message;
           const live = liveTimes.get(draftKey(caption.text));
           if (audioOrigin !== undefined) {
@@ -297,7 +307,9 @@ async function start(source: Source, streamId: string, token: string, sentenceHo
           if (servesTranslation()) serviceQueue.enqueue(caption as Caption);
           void pumpDrafts();
         } else if (message.type === 'preview' && message.sessionId === state.sessionId) {
+          const previousText = preview?.text;
           preview = mergePreview(preview, message as EnglishPreview, state.sessionId);
+          if (preview?.text && preview.text !== previousText) continueListening();
           updateLiveTimes();
           publish({ type: 'preview', preview });
           void pumpDrafts();
@@ -391,6 +403,7 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
         outputs.configure(message.autoSave === true);
         if (message.autoSave === true) captions.forEach(caption => outputs.enqueue(caption));
       }
+      if ('idleReminder' in message) { idleReminder = message.idleReminder === true; continueListening(); }
       if ('translationMode' in message) setTranslationMode(message.translationMode);
       return { ok: true };
     }
@@ -398,11 +411,14 @@ browser.runtime.onMessage.addListener((message, sender, respond) => {
       lastLease = Date.now();
       return { ok: true };
     }
-    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode, message.desktop === true);
+    if (message.type === 'start') return start(message.source, message.streamId, message.token, message.sentenceHold || DEFAULT_SETTINGS.sentenceHold, message.autoSave ?? DEFAULT_SETTINGS.autoSave, message.translationMode, message.desktop === true, message.idleReminder === true);
+    if (message.type === 'continueListening') { continueListening(); return { ok: true }; }
     if (message.type === 'pause' && state.phase === 'capturing') {
+      continueListening();
       setState({ phase: 'paused' });
       socket?.send(JSON.stringify({ type: 'pause' }));
     } else if (message.type === 'resume' && state.phase === 'paused') {
+      continueListening();
       socket?.send(JSON.stringify({ type: 'resume' }));
       setState({ phase: 'capturing' });
     } else if (message.type === 'stop') await stop();
@@ -432,6 +448,11 @@ browser.runtime.onConnect.addListener(port => {
 setInterval(() => {
   // Floating captions are a view too: the side panel may close during a meeting.
   if (overlays.size) lastLease = Date.now();
+  if (idleReminder && state.phase === 'capturing' && Date.now() >= lastSpeech + IDLE_NOTICE_MS) {
+    const deadline = lastSpeech + IDLE_NOTICE_MS + IDLE_GRACE_MS;
+    if (Date.now() >= deadline) { void stop('长时间没有新字幕，已自动结束。'); return; }
+    if (state.idleStopAt !== deadline) setState({ idleStopAt: deadline });
+  }
   if (isActive(state.phase) && state.phase !== 'stopping' && Date.now() - lastLease > 10000) {
     recordDiagnostic('capture', 'view_lease_expired'); void stop('侧栏和悬浮字幕都已关闭，采集自动停止。');
   }

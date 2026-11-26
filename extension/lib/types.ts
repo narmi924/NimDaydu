@@ -18,6 +18,7 @@ export type CaptureState = {
   pending?: boolean;
   recovering?: boolean;
   saveError?: string;
+  idleStopAt?: number;
 };
 /** Live English, already cut into the rows its settled captions will take (`units`). */
 export type EnglishPreview = { sessionId: string; revision: number; text: string; start: number; end: number; units?: string[]; speechEnded?: boolean };

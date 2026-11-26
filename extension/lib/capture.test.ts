@@ -319,3 +319,21 @@ it('keeps only the shared audio and rejects a source with no audio before starti
   expect(shared.removeTrack).toHaveBeenCalledWith(video);
   expect(sockets[0]?.sent.find(packet => packet.type === 'hello')?.sampleRate).toBe(16000);
 });
+
+it('shares the silence countdown across views and cancels it on speech or a request to keep listening', async () => {
+  await start(false);
+  runtime.connect({ name: 'nimdaydu-overlay', sender: { id: 'nimdaydu-test' }, postMessage() {},
+    onDisconnect: { addListener() {} } });
+  await vi.advanceTimersByTimeAsync(660_000);
+  expect((await command('snapshot')).state.phase).toBe('capturing');
+  await command('settings', { idleReminder: true });
+  await vi.advanceTimersByTimeAsync(600_000);
+  expect((await command('snapshot')).state.idleStopAt).toBe(Date.now() + 60_000);
+  await command('continueListening');
+  expect((await command('snapshot')).state.idleStopAt).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(600_000);
+  sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'Hello again', start: 0, end: 1 });
+  expect((await command('snapshot')).state.idleStopAt).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(666_000);
+  expect((await command('snapshot')).state.phase).toBe('stopped');
+});

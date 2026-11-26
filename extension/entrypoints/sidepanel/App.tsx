@@ -51,8 +51,6 @@ export default function App() {
     finally { setEditing(false); }
   }
   const [pageEnd, setPageEnd] = useState<number>();
-  const [idlePrompt, setIdlePrompt] = useState(false);
-  const lastSpeech = useRef(Date.now());
   const [elapsed, setElapsed] = useState(0);
   const settingsRef = useRef(settings);
   const stateRef = useRef(state);
@@ -227,14 +225,6 @@ export default function App() {
   }
   const active = isActive(state.phase);
   useEffect(() => {
-    lastSpeech.current = Date.now(); setIdlePrompt(false);
-  }, [preview?.text, captions.length, state.phase]);
-  useEffect(() => {
-    if (!settings.idleReminder || state.phase !== 'capturing') return;
-    const timer = setInterval(() => { if (Date.now() - lastSpeech.current >= 600000) setIdlePrompt(true); }, 5000);
-    return () => clearInterval(timer);
-  }, [settings.idleReminder, state.phase]);
-  useEffect(() => {
     setPageEnd(search.trim() ? 60 : undefined);
     if (search.trim() && scrollRef.current) scrollRef.current.scrollTop = 0;
   }, [search, state.sessionId]);
@@ -302,7 +292,8 @@ export default function App() {
       {pendingLabel && !search && <div className="pending" role="status"><span className="pending-dot"/>{pendingLabel}</div>}
     </div>
     {!following && (readable.length > 0 || visiblePreview) && <button className="back-to-live" onClick={() => { setSearch(''); setPageEnd(undefined); setFollowing(true); }}><Icon name="arrow" size={14}/>回到最新</button>}
-    {idlePrompt && settings.idleReminder && state.phase === 'capturing' && <div className="notice" role="status">十分钟没有新字幕。<button onClick={() => { lastSpeech.current = Date.now(); setIdlePrompt(false); }}>继续听</button><button onClick={() => void control('stop')}>结束</button></div>}
+    {state.idleStopAt && state.phase === 'capturing' && <div className="notice" role="status">十分钟没有新字幕，将在 {Math.max(0, Math.ceil((state.idleStopAt - Date.now()) / 1000))} 秒后结束。
+      <button onClick={() => void sendOffscreen({ type: 'continueListening' })}>继续听</button><button onClick={() => void control('stop')}>结束</button></div>}
     <footer className="controls">
       {!active ? <button className="button primary" onClick={() => void start()} disabled={working || checking || !source}><Icon name="play" size={16}/>{working ? '连接中…' : '开始'}</button>
         : <><button className="button primary" onClick={() => void control(state.phase === 'paused' ? 'resume' : 'pause')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name={state.phase === 'paused' ? 'play' : 'pause'} size={16}/>{state.phase === 'paused' ? '继续' : '暂停'}</button><button className="button stop" onClick={() => void control('stop')} disabled={working || state.phase === 'starting' || state.phase === 'stopping'}><Icon name="stop" size={16}/>结束</button></>}

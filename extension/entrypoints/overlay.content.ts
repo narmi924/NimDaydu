@@ -66,7 +66,10 @@ function mountOverlay() {
   const grip = element('div', 'grip'); grip.title = '上下拖动调整高度';
   const list = element('div', 'list');
   const status = element('p', 'status');
-  box.append(tools, grip, list, status);
+  const keepListening = element('button', '', '继续听');
+  keepListening.hidden = true;
+  keepListening.onclick = () => { void browser.runtime.sendMessage({ target: 'offscreen', type: 'continueListening' }); };
+  box.append(tools, grip, list, status, keepListening);
   box.title = '拖动可移动位置，双击回到底部';
   const lane = element('div', 'lane');
   lane.append(box);
@@ -148,14 +151,16 @@ function mountOverlay() {
 
   function render(restack = false) {
     if (!alive) return;
-    box.style.pointerEvents = settings.overlayClickThrough ? 'none' : '';
-    box.inert = settings.overlayClickThrough;
+    const clickThrough = settings.overlayClickThrough && !data.state.idleStopAt;
+    box.style.pointerEvents = clickThrough ? 'none' : '';
+    box.inert = clickThrough;
     if (data.state.sessionId !== sessionId) { sessionId = data.state.sessionId; override = undefined; following = true; }
-    if ((settings.overlayHideQuiet && data.updatedAt > 0 && Date.now() - data.updatedAt > QUIET_MS && following && !drag && !resize) || !overlayVisible(settings.overlay, data.state.phase, Boolean(document.fullscreenElement), override)) { hide(); return; }
+    if ((!data.state.idleStopAt && settings.overlayHideQuiet && data.updatedAt > 0 && Date.now() - data.updatedAt > QUIET_MS && following && !drag && !resize) || !overlayVisible(settings.overlay, data.state.phase, Boolean(document.fullscreenElement), override)) { hide(); return; }
     const mode = settings.translationMode === 'off' ? 'original' : settings.viewMode;
     const rows = overlayRows(data.captions, data.preview, mode, data.drafts);
     renderItems(rows, mode === 'original');
-    status.textContent = rows.length ? '' : data.state.phase === 'paused' ? 'NimDaydu · 已暂停' : 'NimDaydu · 等待语音';
+    keepListening.hidden = !data.state.idleStopAt;
+    status.textContent = data.state.idleStopAt ? '长时间无新字幕，即将自动结束。' : rows.length ? '' : data.state.phase === 'paused' ? 'NimDaydu · 已暂停' : 'NimDaydu · 等待语音';
     box.classList.toggle('quiet', Date.now() - data.updatedAt > QUIET_MS);
     show(restack);
     place();

@@ -92,7 +92,7 @@ export default function App() {
 
     <section className="settings-section" aria-label="悬浮与聆听">
       <h2>悬浮与聆听</h2>
-      {([['overlayClickThrough', '鼠标穿过网页字幕'], ['overlayHideQuiet', '安静十秒后收起网页字幕'], ['idleReminder', '十分钟无字幕时提醒结束']] as const).map(([key, label]) =>
+      {([['overlayClickThrough', '鼠标穿过网页字幕'], ['overlayHideQuiet', '安静十秒后收起网页字幕'], ['idleReminder', '十分钟无新字幕后提醒，一分钟后自动结束']] as const).map(([key, label]) =>
         <label className="setting-row" key={key}>{label}<input type="checkbox" checked={settings[key]} onChange={e => void save({ [key]: e.target.checked })}/></label>)}
     </section>
     <section className="settings-section" aria-labelledby="connection-heading">

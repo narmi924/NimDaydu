@@ -38,7 +38,7 @@ async function openFloating() {
     body.style.fontSize = settings.fontSize + 'px';
     const mode = settings.translationMode === 'off' ? 'original' : settings.viewMode;
     const rows = overlayRows(data.captions, data.preview, mode, data.drafts).slice(-3);
-    if (!rows.length) { body.textContent = '等待实时字幕'; return; }
+    if (!rows.length && !data.state.idleStopAt) { body.textContent = '等待实时字幕'; return; }
     body.replaceChildren(...rows.map(row => {
       const div = pip.document.createElement('div');
       if (row.zh) div.append(row.zh);
@@ -48,6 +48,12 @@ async function openFloating() {
       }
       return div;
     }));
+    if (data.state.idleStopAt) {
+      const button = pip.document.createElement('button');
+      button.textContent = '即将自动结束 · 继续听';
+      button.onclick = () => { void browser.runtime.sendMessage({ target: 'offscreen', type: 'continueListening' }); };
+      body.append(button);
+    }
     body.scrollTop = body.scrollHeight;
   }
   port.onMessage.addListener(message => { data.apply(message); render(); });
