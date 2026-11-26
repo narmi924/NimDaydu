@@ -2,6 +2,8 @@
 
 NimDaydu 帮助听英语通话和视频的人边听边看双语字幕。Moonshine 先给英文草稿，Parakeet 从连续原音定稿，Hy-MT2 负责英译中。本机持续更新的 `OUTPUTS/…/session.json` 可直接供外部程序读取。安装和操作见 [README](../../README.md)。
 
+Windows 的日常入口是桌面的启动、关闭 EXE。macOS 沿用已在 Mac 实机正常使用的主分支版本（`c256f24`）的 Finder 双击入口。Ubuntu 使用同一套启动和停止脚本。
+
 ## Cicada 可借鉴的 27 项
 
 | 编号 | 取舍与实现 |

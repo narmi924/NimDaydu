@@ -15,7 +15,7 @@ if ($health) {
 } else {
     $process = Start-Process -FilePath $pythonPath -ArgumentList @('-m', 'uvicorn', 'nimdaydu.app:app', '--host', '127.0.0.1', '--port', '8765', '--ws-max-size', '262144', '--no-access-log') -WorkingDirectory $serviceDir -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $stateDir 'service.out.log') -RedirectStandardError (Join-Path $stateDir 'service.err.log')
     @{ pid = $process.Id; startTime = $process.StartTime.ToUniversalTime().ToString('o'); executable = $pythonPath } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stateDir 'process.json') -Encoding utf8
-    # Loading the translator on the GPU the first time also compiles its shaders.
+    # Wait for the speech engine. The extension requests the translator separately.
     $deadline = (Get-Date).AddSeconds(90)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 300

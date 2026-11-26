@@ -45,7 +45,7 @@ process = subprocess.Popen(
 print(process.pid)' "$STATE")"
 printf '{"pid": %s, "startTime": "%s", "executable": "%s"}\n' "$pid" "$(ps -o lstart= -p "$pid" | sed 's/^ *//')" "$PY" > "$STATE/process.json"
 
-# The first start after setup also compiles the translator's Metal kernels.
+# Wait for the speech engine. The extension requests the translator separately.
 for _ in $(seq 1 300); do
   sleep 0.3
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -55,7 +55,7 @@ for _ in $(seq 1 300); do
   case "$state" in
     ready)
       summary="$(curl -s -m 2 http://127.0.0.1:8765/health | "$PY" -c 'import json,sys; d=json.load(sys.stdin); print("识别", d["model"], "· 翻译", d.get("translationEngine") or "Hy-MT2 按需加载")')"
-      echo "NimDaydu 已就绪：$summary。音频只在这台 Mac 上处理。"
+      echo "NimDaydu 已就绪：$summary。音频只在本机处理。"
       echo 'Chrome 扩展会自动连接，无需配对码。可以关闭这个窗口。'
       exit 0 ;;
     error:*) echo "${state#error:}" >&2; exit 1 ;;

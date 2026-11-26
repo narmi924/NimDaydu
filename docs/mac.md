@@ -51,7 +51,7 @@
 
 1. 在访达中打开 NimDaydu 文件夹，双击 **Start-NimDaydu.command**。会弹出一个终端窗口。
    - 看到“NimDaydu 已就绪”后，可以关掉这个窗口，服务会继续在后台运行。
-   - 第一次启动要准备显卡，可能需要半分钟左右。
+   - 启动时先加载语音识别模型。打开双语字幕后，服务会按需加载 Hy-MT2。
 2. 在 Chrome 打开有英文声音的网页，点工具栏里的 NimDaydu 图标，或按 **Option + Shift + N**，然后在侧栏点 **开始**。
 3. 网页全屏时，悬浮字幕会自动出现。随时按 **Option + Shift + O** 可以显示或隐藏它。
 4. 用完先在侧栏点 **结束**。不用时双击 **Stop-NimDaydu.command** 释放内存。
@@ -64,7 +64,9 @@
 <td align="center"><sub>悬浮字幕，拖动可以移动，拖顶部横条调高度</sub></td>
 </tr></table>
 
-也可以在终端里运行：`bash ~/NimDaydu/start.sh` 和 `bash ~/NimDaydu/stop.sh`。
+想从桌面启动和关闭时，在访达里分别右键点两个 `.command` 文件，选 **制作替身**，再把两个替身拖到桌面。原文件留在项目文件夹里，更新后替身仍会打开原来的入口。
+
+也可以在终端里运行 `bash ~/NimDaydu/start.sh` 和 `bash ~/NimDaydu/stop.sh`。
 
 第一次双击 `.command` 时，macOS 可能提示“无法打开”或“无法验证开发者”，因为这个文件是从网上下载的。任选一种办法：
 

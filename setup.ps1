@@ -29,9 +29,10 @@ try {
     & npm.cmd run build
     if ($LASTEXITCODE -ne 0) { throw 'Extension build failed.' }
 } finally { Pop-Location }
-Write-Host 'Setup complete. Run start.ps1, then load extension/.output/chrome-mv3 in chrome://extensions.'
 $selectionPath = Join-Path $projectDir '.nimdaydu\asr-model.json'
 if ($PSBoundParameters.ContainsKey('Model') -or -not (Test-Path -LiteralPath $selectionPath)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $selectionPath) | Out-Null
     @{ model = $Model } | ConvertTo-Json | Set-Content -LiteralPath $selectionPath -Encoding utf8
 }
+& (Join-Path $projectDir 'scripts\Install-DesktopLaunchers.ps1')
+Write-Host 'Setup complete. Start NimDaydu from your desktop, then load extension/.output/chrome-mv3 in chrome://extensions.'
