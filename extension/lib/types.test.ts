@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { applyTranslation, mergeCaption, mergePreview, readSettings, type Caption, type EnglishPreview } from './types';
+import { applyTranslation, draftKey, mergeCaption, mergePreview, readSettings, type Caption, type EnglishPreview } from './types';
 
 const base: Caption = { sessionId: 'session', id: 'line', revision: 1, text: 'Open the form', final: false, start: 0, end: 1 };
+
+it('reuses draft formatting changes while keeping meaningful case and punctuation', () => {
+  expect(draftKey(' Use  C++, ')).toBe(draftKey('Use C++.'));
+  expect(draftKey('Ship now?')).not.toBe(draftKey('Ship now.'));
+  expect(draftKey('Use MB')).not.toBe(draftKey('Use Mb'));
+  expect(draftKey('Install 3.12')).not.toBe(draftKey('Install 3 12'));
+  expect(draftKey('Wait...')).not.toBe(draftKey('Wait.'));
+  expect(draftKey('constructor') in {}).toBe(false);
+});
 
 it('enables saving for existing settings while preserving an explicit opt-out', () => {
   expect(readSettings({ schema: 2, translationMode: 'local' })).toMatchObject({ autoSave: true, translationMode: 'offline' });

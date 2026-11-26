@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { draftKey } from './types';
 
 const runtime = vi.hoisted(() => ({ listener: undefined as any, connect: undefined as any, sendMessage: vi.fn() }));
 vi.mock('wxt/browser', () => ({ browser: { runtime: {
@@ -206,14 +207,33 @@ it('translates finished live rows early and reuses them when the caption settles
   await vi.advanceTimersByTimeAsync(10);
   // A last row that already ends the sentence is drafted too.
   expect(requests.map(request => request.text)).toEqual(['Check availability.', 'Then we pay.']);
-  requests.length = 1;
   expect(runtime.sendMessage.mock.calls.some(([message]) => message.type === 'draft' && message.text === '检查可用性。')).toBe(true);
-  expect((await command('snapshot')).drafts).toEqual({ 'check availability': '检查可用性。', 'then we pay': '其他。' });
-  // The settled caption differs only in case and punctuation: no second model call.
+  expect((await command('snapshot')).drafts).toEqual({ [draftKey('Check availability.')]: '检查可用性。', [draftKey('Then we pay.')]: '其他。' });
+  // Dropping the final period doesn't need another model call.
   sockets[0]!.emit(settled('sentence:1', 'Check availability', 0));
   await vi.advanceTimersByTimeAsync(10);
-  expect(requests).toHaveLength(1);
+  expect(requests).toHaveLength(2);
   expect((await command('snapshot')).captions[0].translation).toBe('检查可用性。');
+});
+
+it('translates the final programming language even when a similar name was drafted', async () => {
+  const requested: string[] = [];
+  vi.mocked(fetch).mockImplementation(async (url, init) => {
+    if (!String(url).endsWith('/translate')) return new Response('{}');
+    const { text } = JSON.parse(String(init?.body));
+    requested.push(text);
+    return Response.json({ text: text.replace('We use', '我们用') });
+  });
+  await command('start', { source: { tabId: 1, windowId: 1, title: 'Meeting' }, streamId: 'stream', token: 'test-token',
+    sentenceHold: .4, autoSave: false, translationMode: 'offline' });
+  sockets[0]!.emit({ type: 'preview', sessionId: 'session-1', revision: 1, text: 'We use C++.', start: 0, end: 2 });
+  await vi.advanceTimersByTimeAsync(10);
+  sockets[0]!.emit(settled('sentence:1', 'We use C#.', 0));
+  sockets[0]!.emit(settled('sentence:2', 'We use C.', 2));
+  await vi.advanceTimersByTimeAsync(10);
+  expect(requested).toEqual(['We use C++.', 'We use C#.', 'We use C.']);
+  expect((await command('snapshot')).captions.map((c: { translation: string }) => c.translation))
+    .toEqual(['我们用 C#。', '我们用 C。']);
 });
 
 it('does not translate when translation is disabled', async () => {

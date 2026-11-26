@@ -1,7 +1,7 @@
 import { expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { LiveRows, ParagraphRow } from './CaptionReader';
-import type { Caption, EnglishPreview } from './types';
+import { draftKey, type Caption, type EnglishPreview } from './types';
 const caption: Caption = { sessionId: 'one', id: 'one', revision: 1, final: true, text: 'Open the application form.', start: 0, end: 1 };
 const preview: EnglishPreview = { sessionId: 'one', revision: 1, text: 'Then check the', start: 1, end: 2 };
 
@@ -37,7 +37,7 @@ it('pairs every clause with its own Chinese instead of one block per paragraph',
 
 it('shows early Chinese on finished live rows and only those rows in Chinese-only mode', () => {
   const live = { ...preview, text: 'Check it. Then check the', units: ['Check it.', 'Then check the'] };
-  const drafts = { 'check it': '检查一下。' };
+  const drafts = { [draftKey('Check it.')]: '检查一下。' };
   const bilingual = renderToStaticMarkup(<LiveRows preview={live} mode="bilingual" drafts={drafts}/>);
   expect(bilingual).toContain('<p class="chinese draft" lang="zh-CN">检查一下。</p>');
   expect(bilingual.match(/class="chinese slot"/g)).toHaveLength(1);

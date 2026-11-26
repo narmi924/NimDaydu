@@ -60,9 +60,11 @@ export function applyTranslation(captions: Caption[], message: { sessionId: stri
   return updated;
 }
 
-/** Live and settled English often differ only in case or punctuation. */
+/** Ignore spacing and the final comma or period added by caption assembly. */
 export function draftKey(text: string): string {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}']+/gu, ' ').trim();
+  const english = text.trim().replace(/\s+/gu, ' ').replace(/([^.,\s])[.,]$/u, '$1');
+  // Drafts also travel in plain objects. A spoken "constructor" must be a cache miss.
+  return `en:${english}`;
 }
 
 /** Chinese for live English rows, keyed by draftKey; shown dimmed until the caption settles. */

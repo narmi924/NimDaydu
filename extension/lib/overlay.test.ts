@@ -1,6 +1,6 @@
 import { expect, it } from 'vitest';
 import { OverlayCaptions, clampView, overlayRows, overlayVisible } from './overlay';
-import type { Caption, EnglishPreview } from './types';
+import { draftKey, type Caption, type EnglishPreview } from './types';
 
 const caption = (id: string, text: string, translation?: string): Caption => ({ sessionId: 's', id, revision: 1, final: true, text,
   start: 0, end: 1, ...(translation ? { translation, translationRevision: 1 } : {}) });
@@ -61,7 +61,7 @@ it('follows one session, keeps recent sentences, applies late Chinese and live E
 
 it('shows early Chinese for finished live rows, dimmed, in bilingual and Chinese-only modes', () => {
   const preview = live('And check the date. The booking', ['And check the date.', 'The booking']);
-  const drafts = { 'and check the date': '再核对日期。' };
+  const drafts = { [draftKey('And check the date.')]: '再核对日期。' };
   expect(overlayRows([], preview, 'bilingual', drafts)).toEqual([
     { key: 'live:0', zh: '再核对日期。', en: 'And check the date.', live: true, draft: true },
     { key: 'live:1', en: 'The booking', live: true },
